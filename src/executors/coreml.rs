@@ -89,7 +89,7 @@ pub fn run_coreml_with_inputs_with_weights(
     inputs: Vec<CoremlInput>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     autoreleasepool(|| {
-        run_impl_with_inputs_with_weights(model_bytes, weights_data, inputs, None, None, None)
+        run_impl_with_input_refs_with_weights(model_bytes, weights_data, &inputs, None, None, None)
     })
 }
 
@@ -100,7 +100,18 @@ pub fn run_coreml_with_inputs_cached(
     cache_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     autoreleasepool(|| {
-        run_impl_with_inputs_with_weights(model_bytes, None, inputs, cache_path, None, None)
+        run_impl_with_input_refs_with_weights(model_bytes, None, &inputs, cache_path, None, None)
+    })
+}
+
+/// Run CoreML inference with borrowed input data and model caching.
+pub fn run_coreml_with_input_refs_cached(
+    model_bytes: &[u8],
+    inputs: &[CoremlInput],
+    cache_path: Option<&Path>,
+) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+    autoreleasepool(|| {
+        run_impl_with_input_refs_with_weights(model_bytes, None, inputs, cache_path, None, None)
     })
 }
 
@@ -112,10 +123,10 @@ pub fn run_coreml_with_inputs_checked(
     output_descriptors: &HashMap<String, OperandDescriptor>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     autoreleasepool(|| {
-        run_impl_with_inputs_with_weights(
+        run_impl_with_input_refs_with_weights(
             model_bytes,
             None,
-            inputs,
+            &inputs,
             None,
             Some(input_descriptors),
             Some(output_descriptors),
@@ -269,20 +280,20 @@ fn run_impl_with_inputs(
     inputs: Vec<CoremlInput>,
     cache_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    run_impl_with_inputs_with_weights(model_bytes, None, inputs, cache_path, None, None)
+    run_impl_with_input_refs_with_weights(model_bytes, None, &inputs, cache_path, None, None)
 }
 
-fn run_impl_with_inputs_with_weights(
+fn run_impl_with_input_refs_with_weights(
     model_bytes: &[u8],
     weights_data: Option<&[u8]>,
-    inputs: Vec<CoremlInput>,
+    inputs: &[CoremlInput],
     cache_path: Option<&Path>,
     input_descriptors: Option<&HashMap<String, OperandDescriptor>>,
     output_descriptors: Option<&HashMap<String, OperandDescriptor>>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     let mut runtime_shape_state = RuntimeShapeState::new();
     let mut actual_input_shapes = HashMap::new();
-    for input in &inputs {
+    for input in inputs {
         validate_shape_data_length(&input.name, &input.shape, input.data.len())?;
         actual_input_shapes.insert(input.name.clone(), input.shape.clone());
     }
@@ -327,7 +338,7 @@ fn run_impl_with_inputs_with_weights(
             let mut feature_err: Option<String> = None;
 
             // Create input features with actual data
-            for input in &inputs {
+            for input in inputs {
                 let key = nsstring_from_str(&input.name)?;
                 let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
 
