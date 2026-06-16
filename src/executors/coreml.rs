@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -45,6 +46,195 @@ pub struct CoremlOutput {
 pub struct CoremlRunAttempt {
     pub compute_unit: &'static str,
     pub result: Result<Vec<CoremlOutput>, String>,
+}
+
+struct CoremlLoadedModel {
+    compute_unit: &'static str,
+    model: *mut Object,
+}
+
+struct CoremlLoadFailure {
+    compute_unit: &'static str,
+    reason: String,
+}
+
+/// Reusable CoreML runtime session.
+///
+/// Constructing a session compiles or loads a compiled CoreML model, then retains the loaded
+/// `MLModel` objects for subsequent predictions. This separates model/session setup from
+/// inference and avoids paying CoreML model loading overhead for every call.
+pub struct CoremlSession {
+    models: Vec<CoremlLoadedModel>,
+    load_failures: Vec<CoremlLoadFailure>,
+    cleanup_paths: Vec<PathBuf>,
+}
+
+impl fmt::Debug for CoremlSession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoremlSession")
+            .field("models", &self.models.len())
+            .field("load_failures", &self.load_failures.len())
+            .field("cleanup_paths", &self.cleanup_paths)
+            .finish()
+    }
+}
+
+// CoreML's MLModel is designed for repeated prediction calls. We require mutable access for
+// prediction so callers synchronize shared use explicitly, while allowing a session to be stored in
+// a Mutex and moved to worker threads.
+unsafe impl Send for CoremlSession {}
+
+impl Drop for CoremlSession {
+    fn drop(&mut self) {
+        autoreleasepool(|| unsafe {
+            for loaded in &self.models {
+                let () = msg_send![loaded.model, release];
+            }
+        });
+
+        for path in &self.cleanup_paths {
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(path);
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+impl CoremlSession {
+    pub fn new(model_bytes: &[u8], cache_path: Option<&Path>) -> Result<Self, GraphError> {
+        Self::new_with_weights(model_bytes, None, cache_path)
+    }
+
+    pub fn new_with_weights(
+        model_bytes: &[u8],
+        weights_data: Option<&[u8]>,
+        cache_path: Option<&Path>,
+    ) -> Result<Self, GraphError> {
+        autoreleasepool(|| unsafe {
+            let (compiled_url, compiled_path, temp_model) =
+                prepare_compiled_model_with_weights(model_bytes, weights_data, cache_path)?;
+            let mut cleanup_paths = Vec::new();
+            if cache_path.is_none() {
+                cleanup_paths.push(compiled_path);
+            }
+            if let Some(temp_model) = temp_model {
+                cleanup_paths.push(temp_model);
+            }
+            Self::load_from_compiled_url(compiled_url, cleanup_paths)
+        })
+    }
+
+    pub fn run(&mut self, inputs: &[CoremlInput]) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+        self.run_checked(inputs, None, None)
+    }
+
+    pub fn run_checked(
+        &mut self,
+        inputs: &[CoremlInput],
+        input_descriptors: Option<&HashMap<String, OperandDescriptor>>,
+        output_descriptors: Option<&HashMap<String, OperandDescriptor>>,
+    ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+        let mut runtime_shape_state = RuntimeShapeState::new();
+        let mut actual_input_shapes = HashMap::new();
+        for input in inputs {
+            validate_shape_data_length(&input.name, &input.shape, input.data.len())?;
+            actual_input_shapes.insert(input.name.clone(), input.shape.clone());
+        }
+        if let Some(descriptors) = input_descriptors {
+            runtime_shape_state.validate_named_shapes(
+                &actual_input_shapes,
+                descriptors,
+                TensorKind::Input,
+            )?;
+        }
+
+        let mut attempts = self
+            .load_failures
+            .iter()
+            .map(|failure| CoremlRunAttempt {
+                compute_unit: failure.compute_unit,
+                result: Err(failure.reason.clone()),
+            })
+            .collect::<Vec<_>>();
+
+        autoreleasepool(|| unsafe {
+            for loaded in &self.models {
+                let result =
+                    predict_with_model(loaded.model, inputs).map_err(|err| err.to_string());
+                attempts.push(CoremlRunAttempt {
+                    compute_unit: loaded.compute_unit,
+                    result,
+                });
+            }
+        });
+
+        if let Some(descriptors) = output_descriptors {
+            for attempt in &attempts {
+                if let Ok(outputs) = &attempt.result {
+                    let mut actual_output_shapes = HashMap::new();
+                    for output in outputs {
+                        let mut shape = Vec::with_capacity(output.shape.len());
+                        for &dim in &output.shape {
+                            let dim = usize::try_from(dim).map_err(|_| {
+                                GraphError::CoremlRuntimeFailed {
+                                    reason: format!(
+                                        "output `{}` has invalid negative dimension {}",
+                                        output.name, dim
+                                    ),
+                                }
+                            })?;
+                            shape.push(dim);
+                        }
+                        actual_output_shapes.insert(output.name.clone(), shape);
+                    }
+                    runtime_shape_state.validate_named_shapes(
+                        &actual_output_shapes,
+                        descriptors,
+                        TensorKind::Output,
+                    )?;
+                }
+            }
+        }
+
+        Ok(attempts)
+    }
+
+    unsafe fn load_from_compiled_url(
+        compiled_url: *mut Object,
+        cleanup_paths: Vec<PathBuf>,
+    ) -> Result<Self, GraphError> {
+        let targets = [(3i64, "CPU_AND_NE"), (0i64, "ALL")];
+        let mut models = Vec::new();
+        let mut load_failures = Vec::new();
+
+        for (code, name) in targets {
+            let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let () = msg_send![config, setComputeUnits: code];
+            let mut error: *mut Object = ptr::null_mut();
+            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
+            let () = msg_send![config, release];
+            if model.is_null() {
+                load_failures.push(CoremlLoadFailure {
+                    compute_unit: name,
+                    reason: unsafe { ns_error_to_string(error, "MLModel load failed") },
+                });
+            } else {
+                let retained_model: *mut Object = msg_send![model, retain];
+                models.push(CoremlLoadedModel {
+                    compute_unit: name,
+                    model: retained_model,
+                });
+            }
+        }
+
+        Ok(Self {
+            models,
+            load_failures,
+            cleanup_paths,
+        })
+    }
 }
 
 pub fn run_coreml_zeroed(
@@ -88,9 +278,8 @@ pub fn run_coreml_with_inputs_with_weights(
     weights_data: Option<&[u8]>,
     inputs: Vec<CoremlInput>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    autoreleasepool(|| {
-        run_impl_with_input_refs_with_weights(model_bytes, weights_data, &inputs, None, None, None)
-    })
+    let mut session = CoremlSession::new_with_weights(model_bytes, weights_data, None)?;
+    session.run(&inputs)
 }
 
 /// Run CoreML inference with actual input data and model caching
@@ -99,9 +288,8 @@ pub fn run_coreml_with_inputs_cached(
     inputs: Vec<CoremlInput>,
     cache_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    autoreleasepool(|| {
-        run_impl_with_input_refs_with_weights(model_bytes, None, &inputs, cache_path, None, None)
-    })
+    let mut session = CoremlSession::new(model_bytes, cache_path)?;
+    session.run(&inputs)
 }
 
 /// Run CoreML inference with borrowed input data and model caching.
@@ -110,9 +298,8 @@ pub fn run_coreml_with_input_refs_cached(
     inputs: &[CoremlInput],
     cache_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    autoreleasepool(|| {
-        run_impl_with_input_refs_with_weights(model_bytes, None, inputs, cache_path, None, None)
-    })
+    let mut session = CoremlSession::new(model_bytes, cache_path)?;
+    session.run(inputs)
 }
 
 /// Run CoreML inference with runtime descriptor checks for dynamic dimensions.
@@ -122,16 +309,8 @@ pub fn run_coreml_with_inputs_checked(
     input_descriptors: &HashMap<String, OperandDescriptor>,
     output_descriptors: &HashMap<String, OperandDescriptor>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    autoreleasepool(|| {
-        run_impl_with_input_refs_with_weights(
-            model_bytes,
-            None,
-            &inputs,
-            None,
-            Some(input_descriptors),
-            Some(output_descriptors),
-        )
-    })
+    let mut session = CoremlSession::new(model_bytes, None)?;
+    session.run_checked(&inputs, Some(input_descriptors), Some(output_descriptors))
 }
 
 #[allow(dead_code)]
@@ -166,6 +345,7 @@ fn run_impl_zeroed_with_weights(
             let () = msg_send![config, setComputeUnits: code];
             let mut error: *mut Object = ptr::null_mut();
             let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
+            let () = msg_send![config, release];
             if model.is_null() {
                 attempts.push(CoremlRunAttempt {
                     compute_unit: name,
@@ -274,197 +454,64 @@ fn run_impl_zeroed_with_weights(
     }
 }
 
-#[allow(dead_code)]
-fn run_impl_with_inputs(
-    model_bytes: &[u8],
-    inputs: Vec<CoremlInput>,
-    cache_path: Option<&Path>,
-) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    run_impl_with_input_refs_with_weights(model_bytes, None, &inputs, cache_path, None, None)
-}
-
-fn run_impl_with_input_refs_with_weights(
-    model_bytes: &[u8],
-    weights_data: Option<&[u8]>,
+unsafe fn predict_with_model(
+    model: *mut Object,
     inputs: &[CoremlInput],
-    cache_path: Option<&Path>,
-    input_descriptors: Option<&HashMap<String, OperandDescriptor>>,
-    output_descriptors: Option<&HashMap<String, OperandDescriptor>>,
-) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    let mut runtime_shape_state = RuntimeShapeState::new();
-    let mut actual_input_shapes = HashMap::new();
+) -> Result<Vec<CoremlOutput>, GraphError> {
+    let model_description: *mut Object = msg_send![model, modelDescription];
+    let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
+
+    let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
+
     for input in inputs {
-        validate_shape_data_length(&input.name, &input.shape, input.data.len())?;
-        actual_input_shapes.insert(input.name.clone(), input.shape.clone());
+        let key = unsafe { nsstring_from_str(&input.name)? };
+        let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
+
+        let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
+        let data_type_code = if desc_obj.is_null() {
+            32
+        } else {
+            let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
+            if constraint_obj.is_null() {
+                32
+            } else {
+                let ml_data_type: i64 = msg_send![constraint_obj, dataType];
+                ml_data_type as i32
+            }
+        };
+
+        let array = unsafe { create_multi_array(&shape_i64, data_type_code)? };
+        unsafe {
+            fill_data_with_type_conversion(array, &input.data, &shape_i64, data_type_code)?;
+        }
+
+        let feature_value: *mut Object =
+            msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
+        let () = msg_send![dict, setObject: feature_value forKey: key];
     }
-    if let Some(descriptors) = input_descriptors {
-        runtime_shape_state.validate_named_shapes(
-            &actual_input_shapes,
-            descriptors,
-            TensorKind::Input,
-        )?;
+
+    let mut create_error: *mut Object = ptr::null_mut();
+    let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
+    let provider: *mut Object =
+        msg_send![provider_alloc, initWithDictionary: dict error: &mut create_error];
+    if provider.is_null() {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: unsafe {
+                ns_error_to_string(create_error, "MLDictionaryFeatureProvider init failed")
+            },
+        });
     }
 
-    unsafe {
-        let (compiled_url, compiled_path_buf, temp_mlmodel) =
-            prepare_compiled_model_with_weights(model_bytes, weights_data, cache_path)?;
-
-        // Try only Neural Engine + GPU (best performance on Apple Silicon)
-        // Fallback to ALL if that fails
-        let targets = [
-            (3i64, "CPU_AND_NE"), // Neural Engine + GPU (best for Apple Silicon)
-            (0i64, "ALL"),        // Fallback to all available compute units
-        ];
-        let mut attempts = Vec::new();
-
-        for (code, name) in targets {
-            let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
-            let () = msg_send![config, setComputeUnits: code];
-            let mut error: *mut Object = ptr::null_mut();
-            let model: *mut Object = msg_send![class!(MLModel), modelWithContentsOfURL: compiled_url configuration: config error: &mut error];
-            if model.is_null() {
-                attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(ns_error_to_string(error, "MLModel load failed")),
-                });
-                continue;
-            }
-
-            // Get model input descriptions to query expected data types
-            let model_description: *mut Object = msg_send![model, modelDescription];
-            let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
-
-            let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
-            let mut feature_err: Option<String> = None;
-
-            // Create input features with actual data
-            for input in inputs {
-                let key = nsstring_from_str(&input.name)?;
-                let shape_i64: Vec<i64> = input.shape.iter().map(|&s| s as i64).collect();
-
-                // Query model's expected data type for this input
-                // Following Chromium's approach: match the model's expected type to avoid conversion errors
-                let desc_obj: *mut Object = msg_send![input_descs, objectForKey: key];
-                let data_type_code = if desc_obj.is_null() {
-                    // No model info - default to Float32
-                    32
-                } else {
-                    let constraint_obj: *mut Object = msg_send![desc_obj, multiArrayConstraint];
-                    if constraint_obj.is_null() {
-                        // No constraint - default to Float32
-                        32
-                    } else {
-                        let ml_data_type: i64 = msg_send![constraint_obj, dataType];
-                        ml_data_type as i32
-                    }
-                };
-
-                // Create MLMultiArray with the model's expected data type
-                let array = match create_multi_array(&shape_i64, data_type_code) {
-                    Ok(arr) => arr,
-                    Err(err) => {
-                        feature_err = Some(err.to_string());
-                        break;
-                    }
-                };
-
-                // Fill with actual data, converting to the target type if needed
-                if let Err(err) =
-                    fill_data_with_type_conversion(array, &input.data, &shape_i64, data_type_code)
-                {
-                    feature_err = Some(err.to_string());
-                    break;
-                }
-
-                let feature_value: *mut Object =
-                    msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
-                let () = msg_send![dict, setObject: feature_value forKey: key];
-            }
-
-            if let Some(reason) = feature_err {
-                attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(reason),
-                });
-                continue;
-            }
-
-            let mut create_error: *mut Object = ptr::null_mut();
-            let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
-            let provider: *mut Object =
-                msg_send![provider_alloc, initWithDictionary: dict error: &mut create_error];
-            if provider.is_null() {
-                attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(ns_error_to_string(
-                        create_error,
-                        "MLDictionaryFeatureProvider init failed",
-                    )),
-                });
-                continue;
-            }
-
-            let mut predict_error: *mut Object = ptr::null_mut();
-            let output_provider: *mut Object =
-                msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
-            if output_provider.is_null() {
-                attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(ns_error_to_string(predict_error, "prediction failed")),
-                });
-                continue;
-            }
-
-            match collect_outputs(output_provider) {
-                Ok(outputs) => attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Ok(outputs),
-                }),
-                Err(err) => attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(err.to_string()),
-                }),
-            }
-        }
-
-        if let Some(tmp) = temp_mlmodel {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        // Only delete compiled model if not cached
-        if cache_path.is_none() {
-            let _ = std::fs::remove_dir_all(&compiled_path_buf);
-        }
-
-        if let Some(descriptors) = output_descriptors {
-            for attempt in &attempts {
-                if let Ok(outputs) = &attempt.result {
-                    let mut actual_output_shapes = HashMap::new();
-                    for output in outputs {
-                        let mut shape = Vec::with_capacity(output.shape.len());
-                        for &dim in &output.shape {
-                            let dim = usize::try_from(dim).map_err(|_| {
-                                GraphError::CoremlRuntimeFailed {
-                                    reason: format!(
-                                        "output `{}` has invalid negative dimension {}",
-                                        output.name, dim
-                                    ),
-                                }
-                            })?;
-                            shape.push(dim);
-                        }
-                        actual_output_shapes.insert(output.name.clone(), shape);
-                    }
-                    runtime_shape_state.validate_named_shapes(
-                        &actual_output_shapes,
-                        descriptors,
-                        TensorKind::Output,
-                    )?;
-                }
-            }
-        }
-
-        Ok(attempts)
+    let mut predict_error: *mut Object = ptr::null_mut();
+    let output_provider: *mut Object =
+        msg_send![model, predictionFromFeatures: provider error: &mut predict_error];
+    if output_provider.is_null() {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: unsafe { ns_error_to_string(predict_error, "prediction failed") },
+        });
     }
+
+    unsafe { collect_outputs(output_provider) }
 }
 
 unsafe fn collect_outputs(provider: *mut Object) -> Result<Vec<CoremlOutput>, GraphError> {
@@ -592,6 +639,13 @@ pub unsafe fn prepare_compiled_model_with_weights(
     weights_data: Option<&[u8]>,
     cached_compiled: Option<&Path>,
 ) -> Result<(*mut Object, PathBuf, Option<PathBuf>), GraphError> {
+    if let Some(path) = cached_compiled
+        && path.exists()
+    {
+        let persisted_url = unsafe { nsurl_from_path(path)? };
+        return Ok((persisted_url, path.to_path_buf(), None));
+    }
+
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
     let url = unsafe { nsurl_from_path(&temp_mlmodel)? };
     let mut compile_error: *mut Object = ptr::null_mut();
@@ -957,4 +1011,90 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use super::*;
+    use crate::graph::{GraphInfo, Operand, OperandKind, to_dimension_vector};
+    use crate::operators::Operation;
+
+    fn relu_graph() -> GraphInfo {
+        GraphInfo {
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: to_dimension_vector(&[4]),
+                        pending_permutation: vec![],
+                    },
+                },
+                Operand {
+                    name: Some("output".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: to_dimension_vector(&[4]),
+                        pending_permutation: vec![],
+                    },
+                },
+            ],
+            operations: vec![Operation::Relu {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }],
+            constant_operand_ids_to_handles: HashMap::new(),
+            id_to_constant_tensor_operand_map: HashMap::new(),
+            quantized: false,
+        }
+    }
+
+    fn output_data(attempts: Vec<CoremlRunAttempt>) -> Result<Vec<f32>, Box<dyn Error>> {
+        let mut errors = Vec::new();
+        for attempt in attempts {
+            match attempt.result {
+                Ok(outputs) => {
+                    for output in outputs {
+                        if output.name == "output" {
+                            return Ok(output.data);
+                        }
+                    }
+                    return Err(Box::new(std::io::Error::other(
+                        "CoreML test model returned no `output` tensor",
+                    )));
+                }
+                Err(error) => errors.push(format!("{}: {}", attempt.compute_unit, error)),
+            }
+        }
+        Err(Box::new(std::io::Error::other(format!(
+            "CoreML test model had no successful compute attempt: {}",
+            errors.join("; ")
+        ))))
+    }
+
+    #[test]
+    fn session_runs_multiple_predictions() -> Result<(), Box<dyn Error>> {
+        let converted =
+            crate::ConverterRegistry::with_defaults().convert("coreml", &relu_graph())?;
+        let mut session = CoremlSession::new(&converted.data, None)?;
+        let input = CoremlInput {
+            name: "input".to_string(),
+            shape: vec![4],
+            data: vec![-1.0, 0.5, 2.0, -3.0],
+        };
+
+        let first = output_data(session.run(std::slice::from_ref(&input))?)?;
+        let second = output_data(session.run(std::slice::from_ref(&input))?)?;
+
+        assert_eq!(first, vec![0.0, 0.5, 2.0, 0.0]);
+        assert_eq!(second, first);
+        Ok(())
+    }
 }

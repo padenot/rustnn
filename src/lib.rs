@@ -27,7 +27,9 @@ pub use converters::{
     ConvertedGraph, ConverterRegistry, GraphConverter, ONNX_EXTERNAL_WEIGHTS_FILENAME,
 };
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
-pub use coreml::{CoremlOutput, CoremlRunAttempt, run_coreml_zeroed, run_coreml_zeroed_cached};
+pub use coreml::{
+    CoremlOutput, CoremlRunAttempt, CoremlSession, run_coreml_zeroed, run_coreml_zeroed_cached,
+};
 pub use error::GraphError;
 #[cfg(feature = "onnx-runtime")]
 pub use executors::onnx::{
