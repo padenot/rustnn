@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, marker::PhantomData};
 
 use bytemuck::NoUninit;
 use log::{debug, trace};
@@ -40,6 +40,24 @@ pub struct MLGraphBuilder<'context, 'builder> {
     backend: Box<dyn MLBackendBuilder<'context, 'builder> + 'builder>,
 
     graph: Option<GraphInfo>,
+}
+
+#[derive(Debug)]
+struct GraphInfoOnlyBackendBuilder<'context, 'builder> {
+    _context: PhantomData<&'context ()>,
+    _builder: PhantomData<&'builder ()>,
+}
+
+impl<'context, 'builder> MLBackendBuilder<'context, 'builder>
+    for GraphInfoOnlyBackendBuilder<'context, 'builder>
+{
+    fn build(&mut self, _graph: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
+        Err(crate::error::Error::GraphBuildError {
+            source: Box::new(std::io::Error::other(
+                "graph-info-only builder cannot compile graphs",
+            )),
+        })
+    }
 }
 
 pub(crate) fn get_operand(input: MLOperand, graph: &GraphInfo) -> Result<&Operand> {
@@ -1695,6 +1713,23 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         })
     }
 
+    /// Create a builder for graph construction without initializing an execution backend.
+    ///
+    /// This is useful for importers and converters that need the lowered [`GraphInfo`] but want
+    /// to defer backend/session creation to a separate runtime step.
+    pub fn new_for_graph_info() -> Self
+    where
+        'context: 'builder,
+    {
+        Self {
+            backend: Box::new(GraphInfoOnlyBackendBuilder {
+                _context: PhantomData,
+                _builder: PhantomData,
+            }),
+            graph: Some(Default::default()),
+        }
+    }
+
     pub fn build_graph_info(
         &mut self,
         graph: GraphInfo,
@@ -1707,6 +1742,18 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         &mut self,
         outputs: &'_ HashMap<&str, MLOperand>,
     ) -> crate::error::Result<MLGraph<'context>> {
+        let graph = self.finish_graph_info(outputs)?;
+        self.backend.build(graph)
+    }
+
+    /// Finish the builder and return the constructed graph without compiling it for a backend.
+    ///
+    /// This performs the same graph finalization and validation as [`Self::build`], but returns
+    /// the graph before handing it to a backend.
+    pub fn finish_graph_info(
+        &mut self,
+        outputs: &'_ HashMap<&str, MLOperand>,
+    ) -> crate::error::Result<GraphInfo> {
         trace!("Trying to build graph for outputs {outputs:?}");
         // spec: If outputs is empty, then return a new promise in realm rejected with a TypeError.
         if outputs.is_empty() {
@@ -1780,7 +1827,7 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             });
         }
 
-        self.backend.build(graph)
+        Ok(graph)
     }
 
     /// Debug tool to check operand shape
@@ -2572,6 +2619,69 @@ mod test {
         outputs.insert("out1", out1);
         outputs.insert("out2", out2);
         builder.build(&outputs).unwrap();
+    }
+
+    #[test]
+    fn finish_graph_info_returns_uncompiled_graph() {
+        let _ = pretty_env_logger::try_init();
+        let desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            [2, 2].to_vec(),
+        );
+
+        let mut builder = MLGraphBuilder::new_for_graph_info();
+        let input = match builder.input("input", &desc) {
+            Ok(input) => input,
+            Err(error) => panic!("input creation failed: {error}"),
+        };
+        let output = match builder.identity(input) {
+            Ok(output) => output,
+            Err(error) => panic!("identity creation failed: {error}"),
+        };
+        let mut outputs = HashMap::new();
+        outputs.insert("output", output);
+
+        let graph = match builder.finish_graph_info(&outputs) {
+            Ok(graph) => graph,
+            Err(error) => panic!("finish_graph_info failed: {error}"),
+        };
+
+        assert_eq!(graph.input_operands, vec![0]);
+        assert_eq!(graph.output_operands, vec![1]);
+        let output_operand = match graph.operands.get(1) {
+            Some(output_operand) => output_operand,
+            None => panic!("missing output operand"),
+        };
+        assert_eq!(output_operand.name.as_deref(), Some("output"));
+        assert_eq!(output_operand.kind, crate::OperandKind::Output);
+    }
+
+    #[test]
+    fn graph_info_builder_build_reports_missing_backend() {
+        let _ = pretty_env_logger::try_init();
+        let desc = MLOperandDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            [2, 2].to_vec(),
+        );
+
+        let mut builder = MLGraphBuilder::new_for_graph_info();
+        let input = match builder.input("input", &desc) {
+            Ok(input) => input,
+            Err(error) => panic!("input creation failed: {error}"),
+        };
+        let output = match builder.identity(input) {
+            Ok(output) => output,
+            Err(error) => panic!("identity creation failed: {error}"),
+        };
+        let mut outputs = HashMap::new();
+        outputs.insert("output", output);
+
+        let error = match builder.build(&outputs) {
+            Ok(_) => panic!("graph-info-only builder unexpectedly compiled a graph"),
+            Err(error) => error,
+        };
+        let error_message = error.to_string();
+        assert!(error_message.contains("graph-info-only builder cannot compile graphs"));
     }
 
     #[test]
