@@ -690,6 +690,218 @@ impl crate::tensor::DeviceTensorBackend for OrtDeviceTensor {
     }
 }
 
+/// A persistent ONNX Runtime session: model bytes loaded once, reusable across calls.
+///
+/// Unlike [`run_onnx_with_inputs`] which rebuilds the session on every call,
+/// `OrtSession` amortises the startup cost over many inference calls.
+pub struct OrtSession {
+    session: Session,
+    output_names: Vec<String>,
+}
+
+impl OrtSession {
+    /// Build a session from raw ONNX model bytes.
+    ///
+    /// `external_weights` is the `.onnx.data` blob when weights are externalised
+    /// (as produced by rustnn's ONNX converter for large models).
+    pub fn from_model_bytes(
+        model_bytes: &[u8],
+        external_weights: Option<&[u8]>,
+    ) -> Result<Self, GraphError> {
+        ensure_ort_initialized()?;
+        let mut builder = Session::builder()
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("session builder failed: {e}"),
+            })?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("set opt level failed: {e}"),
+            })?;
+        if let Some(weights) = external_weights {
+            builder = builder
+                .with_external_initializer_file_in_memory(
+                    ONNX_EXTERNAL_WEIGHTS_FILENAME,
+                    std::borrow::Cow::Owned(weights.to_vec()),
+                )
+                .map_err(|e| GraphError::OnnxRuntimeFailed {
+                    reason: format!("set external initializer failed: {e}"),
+                })?;
+        }
+        let session = builder
+            .commit_from_memory(model_bytes)
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("load model failed: {e}"),
+            })?;
+        let output_names = session.outputs().iter().map(|o| o.name().to_string()).collect();
+        Ok(Self { session, output_names })
+    }
+
+    /// Run one inference pass.
+    pub fn run(&mut self, inputs: Vec<OnnxInput>) -> Result<Vec<OnnxOutputWithData>, GraphError> {
+        let inputs_by_name: std::collections::HashMap<String, OnnxInput> =
+            inputs.into_iter().map(|i| (i.name.clone(), i)).collect();
+
+        let mut input_session_values: Vec<SessionInputValue> = Vec::new();
+        for input_info in self.session.inputs().iter() {
+            let name = input_info.name().to_string();
+            let input = inputs_by_name
+                .get(&name)
+                .ok_or_else(|| GraphError::OnnxRuntimeFailed {
+                    reason: format!("model expects input '{name}' but it was not provided"),
+                })?;
+            let sv = build_session_input_value(input)?;
+            input_session_values.push(sv);
+        }
+
+        let outputs = self.session.run(input_session_values.as_slice()).map_err(|e| {
+            GraphError::OnnxRuntimeFailed { reason: format!("run failed: {e}") }
+        })?;
+
+        extract_output_tensors(outputs, &self.output_names)
+    }
+}
+
+fn build_session_input_value(input: &OnnxInput) -> Result<SessionInputValue, GraphError> {
+    let sv = match &input.data {
+        TensorData::Float32(data) => {
+            let value = if input.shape.contains(&0) {
+                let array = ArrayD::from_shape_vec(IxDyn(&input.shape), data.clone())
+                    .map_err(|e| GraphError::OnnxRuntimeFailed {
+                        reason: format!("ndarray float32 for {}: {e}", input.name),
+                    })?;
+                Value::from_array(array)
+            } else {
+                let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+                Value::from_array((shape_i64.as_slice(), data.clone()))
+            }
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("float32 tensor for {}: {e}", input.name),
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Float16(data) => {
+            let f16_data: Vec<half::f16> = data.iter().map(|&b| half::f16::from_bits(b)).collect();
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), f16_data)).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("float16 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Int8(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("int8 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Uint8(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("uint8 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Int32(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("int32 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Uint32(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("uint32 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Int64(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("int64 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+        TensorData::Uint64(data) => {
+            let shape_i64: Vec<i64> = input.shape.iter().map(|&d| d as i64).collect();
+            let value = Value::from_array((shape_i64.as_slice(), data.clone())).map_err(|e| {
+                GraphError::OnnxRuntimeFailed { reason: format!("uint64 tensor for {}: {e}", input.name) }
+            })?;
+            SessionInputValue::from(value)
+        }
+    };
+    Ok(sv)
+}
+
+fn extract_output_tensors(
+    outputs: ort::session::SessionOutputs,
+    output_names: &[String],
+) -> Result<Vec<OnnxOutputWithData>, GraphError> {
+    let mut results = Vec::new();
+    for (idx, (_key, value)) in outputs.iter().enumerate() {
+        let name = output_names.get(idx).cloned().unwrap_or_else(|| format!("output_{idx}"));
+        let (shape_vec, data_vec, float32_data, int64_data, uint64_data) =
+            if let Ok((shape, data)) = value.try_extract_tensor::<f32>() {
+                let sv: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                let dv: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+                (sv, dv, Some(data.to_vec()), None, None)
+            } else if let Ok((shape, data)) = value.try_extract_tensor::<half::f16>() {
+                let sv: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                let dv: Vec<f64> = data.iter().map(|&x| x.to_f32() as f64).collect();
+                (sv, dv, None, None, None)
+            } else if let Ok((shape, data)) = value.try_extract_tensor::<i32>() {
+                let sv: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                let dv: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+                (sv, dv, None, None, None)
+            } else if let Ok((shape, data)) = value.try_extract_tensor::<i64>() {
+                let sv: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                let dv: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+                let iv = data.to_vec();
+                (sv, dv, None, Some(iv), None)
+            } else if let Ok((shape, data)) = value.try_extract_tensor::<u64>() {
+                let sv: Vec<usize> = shape.iter().map(|d| *d as usize).collect();
+                let dv: Vec<f64> = data.iter().map(|&x| x as f64).collect();
+                let uv = data.to_vec();
+                (sv, dv, None, None, Some(uv))
+            } else {
+                return Err(GraphError::OnnxRuntimeFailed {
+                    reason: format!("unsupported output tensor type for '{name}'"),
+                });
+            };
+        results.push(OnnxOutputWithData { name, shape: shape_vec, data: data_vec, float32_data, int64_data, uint64_data });
+    }
+    Ok(results)
+}
+
+/// Load a `.webnn` graph file, convert to ONNX, and build a persistent [`OrtSession`].
+///
+/// This is the single entry point for using rustnn's pipeline from external crates: provide a
+/// `.webnn` path (with `parakeet.manifest.json` weights alongside), get back a session you
+/// can call `run()` on repeatedly.
+pub fn load_webnn_as_ort_session(path: &std::path::Path) -> Result<OrtSession, GraphError> {
+    let graph = crate::loader::load_graph_from_path(path)?;
+    let converted = crate::converters::ConverterRegistry::with_defaults()
+        .convert("onnx", &graph)?;
+    OrtSession::from_model_bytes(&converted.data, converted.weights_data.as_deref())
+}
+
+/// Load a `.webnn` graph file and return the raw ONNX bytes.
+///
+/// Returns `(onnx_model_bytes, external_weights_bytes)`.  The second element is `Some` when
+/// the converter externalised large weight tensors (typical for models > a few hundred MB).
+/// Pass both to [`ort::session::Session::builder().commit_from_memory()`] or similar.
+///
+/// This lets external crates (e.g. `parakeet-rs`) load models through rustnn's graph
+/// pipeline while using their own ORT session management.
+pub fn load_webnn_as_onnx_bytes(
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), GraphError> {
+    let graph = crate::loader::load_graph_from_path(path)?;
+    let converted = crate::converters::ConverterRegistry::with_defaults()
+        .convert("onnx", &graph)?;
+    Ok((converted.data, converted.weights_data))
+}
+
 /// Run ONNX model with device tensor bindings (zero-copy execution)
 ///
 /// This function uses ONNX Runtime IoBinding to execute the model with

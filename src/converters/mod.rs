@@ -85,6 +85,22 @@ impl ConverterRegistry {
     }
 }
 
+/// Load a `.webnn` graph file and return the ONNX bytes produced by rustnn's converter.
+///
+/// Returns `(onnx_model_bytes, external_weights_bytes)`.  When weights are externalised
+/// (as is typical for large models), `external_weights_bytes` is `Some` and should be
+/// written to [`ONNX_EXTERNAL_WEIGHTS_FILENAME`] alongside the ONNX file before loading
+/// with ORT's `commit_from_file`, or passed to `with_external_initializer_file_in_memory`.
+///
+/// This function does **not** depend on the `onnx-runtime` feature.
+pub fn load_webnn_as_onnx_bytes(
+    path: &std::path::Path,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), GraphError> {
+    let graph = crate::loader::load_graph_from_path(path)?;
+    let converted = ConverterRegistry::with_defaults().convert("onnx", &graph)?;
+    Ok((converted.data, converted.weights_data))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConverterRegistry, GraphConverter};

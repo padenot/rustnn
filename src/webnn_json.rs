@@ -974,6 +974,17 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                     }
                 }
 
+                "unsqueeze" => {
+                    if let (Some(input_shape), Operation::Unsqueeze { options, .. }) =
+                        (input_shapes.first(), op)
+                    {
+                        let axes = options.as_ref().map(|o| o.axes.as_slice()).unwrap_or(&[]);
+                        infer_unsqueeze_shape_dimensions(input_shape, axes).ok()
+                    } else {
+                        None
+                    }
+                }
+
                 // For other operations, leave shape empty (will be handled later or is dynamic)
                 _ => None,
             };
