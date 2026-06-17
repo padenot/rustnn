@@ -2327,6 +2327,38 @@ impl crate::converters::GraphConverter for OnnxConverter {
         }
 
         for op in &graph.operations {
+            // For Cast, track the output type explicitly from the Cast's target type.
+            if let Operation::Cast { data_type: to, .. } = &op
+                && let Some(output_id) = op.output_operand()
+            {
+                let dt = DataType::from(*to);
+                type_overrides.insert(output_id, dt);
+            }
+
+            // Propagate Float16: if any input to this op is Float16 (from type_overrides or
+            // descriptor), mark the output as Float16.  This keeps fp16 models coherent through
+            // ops like Mul, Add, MatMul that inherit their dtype from inputs.
+            // Exclude Cast: its output type is determined by the `to` attribute, not inputs.
+            if !matches!(&op, Operation::Cast { .. })
+                && let Some(output_id) = op.output_operand()
+            {
+                let any_input_f16 = op.input_operands().iter().any(|&in_id| {
+                    type_overrides.get(&in_id).copied()
+                        .or_else(|| graph.operand(in_id).map(|o| o.descriptor.data_type))
+                        == Some(DataType::Float16)
+                });
+                if any_input_f16 && !type_overrides.contains_key(&output_id) {
+                    let current = graph.operand(output_id).map(|o| o.descriptor.data_type);
+                    if current != Some(DataType::Int64)
+                        && current != Some(DataType::Int32)
+                        && current != Some(DataType::Uint8)
+                        && current != Some(DataType::Int8)
+                    {
+                        type_overrides.insert(output_id, DataType::Float16);
+                    }
+                }
+            }
+
             // Preserve input type for shape-only transforms regardless of shape inference success.
             if (matches!(&op, Operation::Unsqueeze { .. } | Operation::Squeeze { .. }))
                 && let (Some(output_id), Some(&input_id)) =
@@ -2531,6 +2563,9 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     | Operation::Pow { .. }
                     | Operation::Max { .. }
                     | Operation::Min { .. }
+                    | Operation::LogicalAnd { .. }
+                    | Operation::LogicalOr { .. }
+                    | Operation::LogicalXor { .. }
             ) {
                 // Track binary element-wise operation output shapes (use broadcasting)
                 if let Some(output_id) = op.output_operand()
@@ -2700,9 +2735,8 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 {
                     let axes_i64: Vec<i64> = axes_opts.axes.iter().map(|&u| u as i64).collect();
 
-                    if !axes_i64.is_empty() {
+                    if !axes_i64.is_empty() && !input_shape.is_empty() {
                         let axes_u32: Vec<u32> = axes_i64.iter().map(|&a| a as u32).collect();
-
                         let out_shape = infer_unsqueeze_shape(input_shape, &axes_u32)?;
                         shape_overrides.insert(output_id, out_shape.clone());
                         operand_shapes.insert(output_id, out_shape);
@@ -2795,6 +2829,10 @@ impl crate::converters::GraphConverter for OnnxConverter {
 
             // Handle zero-length constants by creating zero-filled tensors
             // This is a defensive measure for malformed models where constants have no data
+            if data.data.is_empty() && std::env::var("RUSTNN_DEBUG").is_ok() {
+                eprintln!("[ONNX DEBUG] constant operand {} ('{}') has empty data! dtype={:?} shape={:?}",
+                    id, operand_name(graph, *id), operand.descriptor.data_type, operand.descriptor.static_or_max_shape());
+            }
             let tensor_proto = if data.data.is_empty() {
                 let element_count: usize = operand
                     .descriptor
@@ -4968,52 +5006,32 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 ));
                 inputs[0] = cast_name;
 
-                // Ensure both value inputs have identical dtype for ONNX Where.
+                if graph.operand(*true_id).is_none() {
+                    return Err(Self::invalid_operand("where true input", *true_id, Some((op, idx))));
+                }
+                if graph.operand(*false_id).is_none() {
+                    return Err(Self::invalid_operand("where false input", *false_id, Some((op, idx))));
+                }
+
+                // Track the output type from false value (the data tensor).
                 {
-                    let target_type = graph
-                        .operand(*true_id)
-                        .map(|operand| {
-                            type_overrides
-                                .get(true_id)
-                                .copied()
-                                .unwrap_or(operand.descriptor.data_type)
-                        })
-                        .ok_or_else(|| {
-                            Self::invalid_operand("where true input", *true_id, Some((op, idx)))
-                        })?;
-
-                    let true_cast_name = format!("{}_true_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_true_{}", op_name, cast_counter),
-                        inputs[1].clone(),
-                        true_cast_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs[1] = true_cast_name;
-
-                    // Validate false operand exists for clearer converter errors.
-                    if graph.operand(*false_id).is_none() {
-                        return Err(Self::invalid_operand(
-                            "where false input",
-                            *false_id,
-                            Some((op, idx)),
-                        ));
-                    }
-
-                    let false_cast_name = format!("{}_false_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_false_{}", op_name, cast_counter),
-                        inputs[2].clone(),
-                        false_cast_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs[2] = false_cast_name;
-
+                    let false_type = graph.operand(*false_id).map(|operand| {
+                        type_overrides.get(false_id).copied().unwrap_or(operand.descriptor.data_type)
+                    });
+                    let true_type = graph.operand(*true_id).map(|operand| {
+                        type_overrides.get(true_id).copied().unwrap_or(operand.descriptor.data_type)
+                    });
+                    let target_type = match (true_type, false_type) {
+                        (_, Some(DataType::Float16)) | (Some(DataType::Float16), _) => DataType::Float16,
+                        (_, Some(ft)) => ft,
+                        (Some(tt), _) => tt,
+                        _ => DataType::Float32,
+                    };
                     if let Some(output_id) = op.output_operand() {
                         type_overrides.insert(output_id, target_type);
                     }
+                    // Do NOT insert explicit casts for true/false — ORT handles type alignment
+                    // internally and rejects explicit same-type casts as "InsertedPrecisionFreeCast".
                 }
 
                 let attributes = Self::create_operation_attributes(op);
@@ -7632,15 +7650,23 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     _ => None,
                 };
                 if let Some(new_shape_attr) = new_shape_attr {
-                    if let Some(shape_dims) = Self::parse_dimension_array(&new_shape_attr) {
-                        // Case 1: newShape is an array (static or dynamic)
-                        let has_dynamic = shape_dims
-                            .iter()
-                            .any(|d| matches!(d, Dimension::Dynamic(_)));
-                        if has_dynamic {
+                    // Try to extract i64 values directly (handles -1 "infer" markers from ONNX).
+                    let literal_i64s: Option<Vec<i64>> = new_shape_attr
+                        .as_array()
+                        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+                        .filter(|v: &Vec<i64>| v.len() == new_shape_attr.as_array().map_or(0, |a| a.len()));
+
+                    if let Some(shape_values) = literal_i64s {
+                        // Contains literals (possibly including -1 for ONNX infer-dim).
+                        let has_dynamic_positive = shape_values.iter().all(|&v| v >= 0)
+                            && Self::parse_dimension_array(&new_shape_attr)
+                                .map(|dims| dims.iter().any(|d| matches!(d, Dimension::Dynamic(_))))
+                                .unwrap_or(false);
+                        if has_dynamic_positive {
+                            let dims: Vec<Dimension> = Self::parse_dimension_array(&new_shape_attr).unwrap();
                             let runtime_shape_name = Self::build_runtime_shape_input(
                                 &format!("{}_shape", op_name),
-                                &shape_dims,
+                                &dims,
                                 graph,
                                 op,
                                 &mut nodes,
@@ -7648,13 +7674,8 @@ impl crate::converters::GraphConverter for OnnxConverter {
                             );
                             inputs.push(runtime_shape_name);
                         } else {
-                            let shape_values: Vec<i64> = shape_dims
-                                .iter()
-                                .map(|d| get_static_or_max_size(d) as i64)
-                                .collect();
                             let shape_name = format!("{}_shape", op_name);
                             inputs.push(shape_name.clone());
-
                             initializers.push(TensorProto {
                                 name: shape_name,
                                 data_type: ProtoDataType::Int64 as i32,
@@ -8788,21 +8809,14 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     _ => 0,
                 };
 
-                let attributes = vec![AttributeProto {
-                    name: "axis".to_string(),
-                    r#type: AttributeType::Int as i32,
-                    i: axis_attr as i64,
-                    ..Default::default()
-                }];
+                let axis = axis_attr as usize;
+                let num_outputs = op.output_operands().len();
 
                 let mut inputs: Vec<String> = op
                     .input_operands()
                     .iter()
                     .map(|id| operand_name(graph, *id))
                     .collect();
-
-                let axis = axis_attr as usize;
-                let num_outputs = op.output_operands().len();
                 let input_id = op.input_operands().first().copied().ok_or_else(|| {
                     GraphError::ConversionFailed {
                         format: "onnx".to_string(),
@@ -8813,36 +8827,49 @@ impl crate::converters::GraphConverter for OnnxConverter {
                     Self::invalid_operand("split input lookup", input_id, Some((op, idx)))
                 })?;
                 let input_dtype = Self::data_type_code(input_operand.descriptor.data_type);
-                let input_shape = input_operand.descriptor.static_or_max_shape();
-                let rank = input_shape.len();
-                if axis >= rank {
-                    Self::eprintln_failed_operation_webnn_json(graph, idx);
-                    return Err(GraphError::ConversionFailed {
-                        format: "onnx".to_string(),
-                        reason: format!("split axis {} out of bounds for rank {}", axis_attr, rank),
+                // Prefer runtime-tracked shape (operand_shapes) over descriptor (may be empty).
+                let input_shape_opt: Option<Vec<u32>> = operand_shapes
+                    .get(&input_id)
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .or_else(|| {
+                        let s = input_operand.descriptor.static_or_max_shape();
+                        (!s.is_empty()).then_some(s)
                     });
-                }
-                let dim_at_axis: i64 = input_shape[axis] as i64;
 
-                let equal_sizes = || {
-                    (0..num_outputs)
-                        .map(|i| {
-                            let base = dim_at_axis / num_outputs as i64;
-                            let rem = dim_at_axis % num_outputs as i64;
-                            if (i as i64) < rem { base + 1 } else { base }
-                        })
-                        .collect::<Vec<i64>>()
+                let explicit_splits: Vec<i64> = match &op {
+                    Operation::Split { splits, .. } if !splits.is_empty() => {
+                        splits.iter().map(|&u| u as i64).collect()
+                    }
+                    _ => vec![],
                 };
 
-                let split_sizes: Vec<i64> = match &op {
-                    Operation::Split { splits, .. } => {
-                        if !splits.is_empty() {
-                            splits.iter().map(|&u| u as i64).collect()
-                        } else {
-                            equal_sizes()
-                        }
+                let split_sizes: Vec<i64> = if !explicit_splits.is_empty() {
+                    explicit_splits
+                } else if let Some(ref input_shape) = input_shape_opt {
+                    if axis >= input_shape.len() {
+                        Self::eprintln_failed_operation_webnn_json(graph, idx);
+                        return Err(GraphError::ConversionFailed {
+                            format: "onnx".to_string(),
+                            reason: format!(
+                                "split axis {} out of bounds for rank {}",
+                                axis_attr,
+                                input_shape.len()
+                            ),
+                        });
                     }
-                    _ => equal_sizes(),
+                    let dim = input_shape[axis] as i64;
+                    (0..num_outputs as i64)
+                        .map(|i| {
+                            let base = dim / num_outputs as i64;
+                            let rem = dim % num_outputs as i64;
+                            if i < rem { base + 1 } else { base }
+                        })
+                        .collect()
+                } else {
+                    // Unknown input shape and no explicit splits: omit split input,
+                    // use num_outputs attribute (ONNX opset 18 requires it in this case).
+                    vec![]
                 };
 
                 if !split_sizes.is_empty() {
@@ -8851,10 +8878,26 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         name: splits_name.clone(),
                         data_type: ProtoDataType::Int64 as i32,
                         dims: vec![split_sizes.len() as i64],
-                        int64_data: split_sizes,
+                        int64_data: split_sizes.clone(),
                         ..Default::default()
                     });
                     inputs.push(splits_name);
+                }
+
+                // Build attributes: axis always; num_outputs when split sizes are omitted (opset 18).
+                let mut attributes = vec![AttributeProto {
+                    name: "axis".to_string(),
+                    r#type: AttributeType::Int as i32,
+                    i: axis_attr as i64,
+                    ..Default::default()
+                }];
+                if split_sizes.is_empty() {
+                    attributes.push(AttributeProto {
+                        name: "num_outputs".to_string(),
+                        r#type: AttributeType::Int as i32,
+                        i: num_outputs as i64,
+                        ..Default::default()
+                    });
                 }
 
                 // ONNX Split may return float; wire Cast to float16 when graph expects float16.
@@ -9623,48 +9666,30 @@ impl crate::converters::GraphConverter for OnnxConverter {
 
                     inputs.push(operand_name(graph, cond_id));
 
-                    let true_type = graph
-                        .operand(true_id)
-                        .map(|operand| {
-                            type_overrides
-                                .get(&true_id)
-                                .copied()
-                                .unwrap_or(operand.descriptor.data_type)
-                        })
-                        .ok_or_else(|| {
-                            Self::invalid_operand("where true input", true_id, Some((op, idx)))
-                        })?;
+                    if graph.operand(true_id).is_none() {
+                        return Err(Self::invalid_operand("where true input", true_id, Some((op, idx))));
+                    }
                     if graph.operand(false_id).is_none() {
-                        return Err(Self::invalid_operand(
-                            "where false input",
-                            false_id,
-                            Some((op, idx)),
-                        ));
+                        return Err(Self::invalid_operand("where false input", false_id, Some((op, idx))));
                     }
 
-                    let target_type = true_type;
+                    let true_type = graph.operand(true_id).map(|operand| {
+                        type_overrides.get(&true_id).copied().unwrap_or(operand.descriptor.data_type)
+                    });
+                    let false_type = graph.operand(false_id).map(|operand| {
+                        type_overrides.get(&false_id).copied().unwrap_or(operand.descriptor.data_type)
+                    });
 
-                    let true_input_name = operand_name(graph, true_id);
-                    let true_cast_output_name = format!("{}_true_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_true_{}", op_name, cast_counter),
-                        true_input_name,
-                        true_cast_output_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs.push(true_cast_output_name);
+                    let target_type = match (true_type, false_type) {
+                        (_, Some(DataType::Float16)) | (Some(DataType::Float16), _) => DataType::Float16,
+                        (_, Some(ft)) => ft,
+                        (Some(tt), _) => tt,
+                        _ => DataType::Float32,
+                    };
 
-                    let false_input_name = operand_name(graph, false_id);
-                    let false_cast_output_name = format!("{}_false_cast_{}", op_name, cast_counter);
-                    cast_counter += 1;
-                    nodes.push(Self::create_cast_node(
-                        &format!("{}_cast_false_{}", op_name, cast_counter),
-                        false_input_name,
-                        false_cast_output_name.clone(),
-                        Self::data_type_code(target_type),
-                    ));
-                    inputs.push(false_cast_output_name);
+                    // Pass inputs directly — no explicit casts to avoid ORT's InsertedPrecisionFreeCast issue.
+                    inputs.push(operand_name(graph, true_id));
+                    inputs.push(operand_name(graph, false_id));
 
                     let output_operand_id = op
                         .output_operand()
