@@ -2657,9 +2657,21 @@ impl Operation {
                 })
             }
             "layerNormalization" if !input_operands.is_empty() => {
+                let base_opts = attributes.as_layer_normalization().cloned();
+                // Positional args: (input, scale?, bias?) — merge into options.
+                let options = Some({
+                    let mut opts = base_opts.unwrap_or_default();
+                    if opts.scale.is_none() && input_operands.len() > 1 {
+                        opts.scale = Some(input_operands[1]);
+                    }
+                    if opts.bias.is_none() && input_operands.len() > 2 {
+                        opts.bias = Some(input_operands[2]);
+                    }
+                    opts
+                });
                 Some(Operation::LayerNormalization {
                     input: at(input_operands, 0)?,
-                    options: attributes.as_layer_normalization().cloned(),
+                    options,
                     outputs: outputs.to_vec(),
                 })
             }
