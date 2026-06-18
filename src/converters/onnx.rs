@@ -3280,8 +3280,38 @@ impl crate::converters::GraphConverter for OnnxConverter {
                 continue;
             }
 
+            // QuantizeLinear / DequantizeLinear: emit as native ONNX nodes so ORT
+            // executes them with its own optimized per-channel kernels. The primitive
+            // decomposition below handles generic WebNN → ONNX conversion, but breaks
+            // per-channel (axis) cases because the Sub/Mul broadcast fails when scale
+            // has a non-scalar shape that doesn't align trivially.
+            if matches!(&op, Operation::QuantizeLinear { .. } | Operation::DequantizeLinear { .. }) {
+                let is_quantize = matches!(&op, Operation::QuantizeLinear { .. });
+                let input_id = op.input_operands()[0];
+                let scale_id = op.input_operands()[1];
+                // zero_point is optional (index 2)
+                let zp_name = op.input_operands().get(2)
+                    .map(|&id| operand_name(graph, id))
+                    .unwrap_or_default();
+                let output_id = op.output_operand()
+                    .ok_or(GraphError::InvalidConversionOperand { operand: 0 })?;
+                nodes.push(NodeProto {
+                    input: vec![
+                        operand_name(graph, input_id),
+                        operand_name(graph, scale_id),
+                        zp_name,
+                    ],
+                    output: vec![operand_name(graph, output_id)],
+                    name: op_name,
+                    op_type: if is_quantize { "QuantizeLinear".to_string() } else { "DequantizeLinear".to_string() },
+                    attribute: vec![],
+                    ..Default::default()
+                });
+                continue;
+            }
+
             // QuantizeLinear is lowered via primitive ops for broader ORT compatibility and
-            // to match WebNN blockwise/per-tensor behavior.
+            // to match WebNN blockwise/per-tensor behavior (kept for non-ORT backends).
             if matches!(&op, Operation::QuantizeLinear { .. }) {
                 let input_id = op.input_operands()[0];
                 let scale_id = op.input_operands()[1];
