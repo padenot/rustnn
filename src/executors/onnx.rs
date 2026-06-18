@@ -27,7 +27,10 @@ pub(crate) fn ensure_ort_initialized() -> Result<(), GraphError> {
         info!("Loading onnxruntime");
         let _is_initial_load = ort::init()
             .with_name("rustnn")
-            .with_execution_providers([ort::ep::CPUExecutionProvider::default().build()])
+            .with_execution_providers([
+                ort::ep::CUDAExecutionProvider::default().build(),
+                ort::ep::CPUExecutionProvider::default().build(),
+            ])
             .with_telemetry(false)
             .commit();
 
@@ -729,6 +732,25 @@ impl OrtSession {
         }
         let session = builder
             .commit_from_memory(model_bytes)
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("load model failed: {e}"),
+            })?;
+        let output_names = session.outputs().iter().map(|o| o.name().to_string()).collect();
+        Ok(Self { session, output_names })
+    }
+
+    /// Build a session from a file path, letting ORT resolve external data automatically.
+    pub fn from_file(path: &std::path::Path) -> Result<Self, GraphError> {
+        ensure_ort_initialized()?;
+        let session = Session::builder()
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("session builder failed: {e}"),
+            })?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| GraphError::OnnxRuntimeFailed {
+                reason: format!("set opt level failed: {e}"),
+            })?
+            .commit_from_file(path)
             .map_err(|e| GraphError::OnnxRuntimeFailed {
                 reason: format!("load model failed: {e}"),
             })?;
