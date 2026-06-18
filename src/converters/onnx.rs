@@ -1230,6 +1230,12 @@ impl OnnxConverter {
         if normalized == "dequantizelinear" {
             return "DequantizeLinear".to_string();
         }
+        if normalized == "convinteger" {
+            return "ConvInteger".to_string();
+        }
+        if normalized == "matmulinteger" {
+            return "MatMulInteger".to_string();
+        }
 
         // Use shared operation name mapper from webnn-onnx-utils
         if let Some(onnx_name) = mapper().webnn_to_onnx(op_type) {
@@ -1514,10 +1520,13 @@ impl OnnxConverter {
     fn create_conv2d_attributes(op: &Operation) -> Vec<AttributeProto> {
         let mut attributes = Vec::new();
 
-        if let Operation::Conv2d {
-            options: Some(opts),
-            ..
-        } = &op
+        let opts_ref = match op {
+            Operation::Conv2d { options: Some(opts), .. } => Some(opts),
+            Operation::ConvInteger { options: Some(opts), .. } => Some(opts),
+            _ => None,
+        };
+
+        if let Some(opts) = opts_ref
         {
             if !opts.strides.is_empty() {
                 Self::add_ints_attribute(
@@ -10209,14 +10218,70 @@ impl crate::converters::GraphConverter for OnnxConverter {
                         )?;
                         continue;
                     }
-                    nodes.push(NodeProto {
-                        input: node_inputs,
-                        output: output_names,
-                        name: op_name,
-                        op_type: Self::onnx_op_type(op.op_type()),
-                        attribute: attributes,
-                        ..Default::default()
-                    });
+                    // ConvInteger / MatMulInteger: emit as native ONNX integer arithmetic nodes.
+                    // NOTE: WebNN extensions proposed in webmachinelearning/webnn#623.
+                    if matches!(&op, Operation::ConvInteger { .. } | Operation::MatMulInteger { .. }) {
+                        let onnx_inputs = match &op {
+                            Operation::ConvInteger { input, filter, input_zero_point, filter_zero_point, .. } => {
+                                vec![
+                                    operand_name(graph, *input),
+                                    operand_name(graph, *filter),
+                                    input_zero_point.map(|i| operand_name(graph, i)).unwrap_or_default(),
+                                    filter_zero_point.map(|i| operand_name(graph, i)).unwrap_or_default(),
+                                ]
+                            }
+                            Operation::MatMulInteger { a, b, a_zero_point, b_zero_point, .. } => {
+                                vec![
+                                    operand_name(graph, *a),
+                                    operand_name(graph, *b),
+                                    a_zero_point.map(|i| operand_name(graph, i)).unwrap_or_default(),
+                                    b_zero_point.map(|i| operand_name(graph, i)).unwrap_or_default(),
+                                ]
+                            }
+                            _ => unreachable!(),
+                        };
+                        let mut conv_attrs = if matches!(&op, Operation::ConvInteger { .. }) {
+                            let attrs = Self::create_conv2d_attributes(op);
+                            // If input is 3D (1D conv), trim 2D attrs back to 1D by keeping
+                            // only the first element of strides/dilations/pads.
+                            if let Operation::ConvInteger { input, .. } = &op {
+                                let rank = graph.operand(*input)
+                                    .map(|o| o.descriptor.static_or_max_shape().len())
+                                    .unwrap_or(4);
+                                if rank == 3 {
+                                    attrs.into_iter().map(|mut a| {
+                                        if a.name == "strides" || a.name == "dilations" {
+                                            a.ints.truncate(1);
+                                        } else if a.name == "pads" && a.ints.len() == 4 {
+                                            // 4-element ONNX pads: [top, left, bottom, right]
+                                            // 1D ONNX pads: [begin, end] = [top, bottom]
+                                            a.ints = vec![a.ints[0], a.ints[2]];
+                                        }
+                                        a
+                                    }).collect()
+                                } else { attrs }
+                            } else { attrs }
+                        } else {
+                            vec![]
+                        };
+                        nodes.push(NodeProto {
+                            input: onnx_inputs,
+                            output: output_names,
+                            name: op_name,
+                            op_type: Self::onnx_op_type(op.op_type()),
+                            attribute: conv_attrs,
+                            ..Default::default()
+                        });
+                    } else {
+                        nodes.push(NodeProto {
+                            input: node_inputs,
+                            output: output_names,
+                            name: op_name,
+                            op_type: Self::onnx_op_type(op.op_type()),
+                            attribute: attributes,
+                            ..Default::default()
+                        });
+                    }
                 }
             }
         }
