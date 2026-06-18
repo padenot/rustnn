@@ -79,6 +79,7 @@ impl fmt::Debug for OrtGraph {
 
 pub(crate) struct OrtBuilder<'a> {
     graph: Option<&'a GraphInfo>,
+    use_cuda: bool,
 }
 
 impl fmt::Debug for OrtBuilder<'_> {
@@ -113,9 +114,22 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for OrtBuilder<'co
         }
 
         ensure_ort_initialized().map_err(|e| Error::GraphBuildError { source: e.into() })?;
-        let session = builder
+        let ep_builder = builder
             .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| Error::GraphBuildError { source: e.into() })?
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let mut ep_builder = if self.use_cuda {
+            ep_builder
+                .with_execution_providers([
+                    ort::ep::CUDAExecutionProvider::default().build(),
+                    ort::ep::CPUExecutionProvider::default().build(),
+                ])
+                .map_err(|e| Error::GraphBuildError { source: e.into() })?
+        } else {
+            ep_builder
+                .with_execution_providers([ort::ep::CPUExecutionProvider::default().build()])
+                .map_err(|e| Error::GraphBuildError { source: e.into() })?
+        };
+        let session = ep_builder
             .commit_from_memory(&converted.data)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
@@ -584,7 +598,8 @@ impl<'context> MLBackendContext<'context> for OrtContext {
     where
         'context: 'builder,
     {
-        Ok(Box::new(OrtBuilder { graph: None }))
+        let use_cuda = self.accelerated();
+        Ok(Box::new(OrtBuilder { graph: None, use_cuda }))
     }
 
     fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> crate::error::Result<MLTensor> {
