@@ -825,6 +825,28 @@ pub enum Operation {
         options: Option<MLOperatorOptions>,
         outputs: Vec<OperandIndex>,
     },
+
+    // ---------- Integer arithmetic (quantized inference) ----------
+    /// Integer convolution: ConvInteger(input: uint8, filter: int8) → int32.
+    /// Compatible with ONNX ConvInteger; backed by native int8 kernels in ORT/TRT.
+    ConvInteger {
+        input: OperandIndex,
+        filter: OperandIndex,
+        input_zero_point: Option<OperandIndex>,
+        filter_zero_point: Option<OperandIndex>,
+        options: Option<MLConv2dOptions>,
+        outputs: Vec<OperandIndex>,
+    },
+    /// Integer matrix multiplication: MatMulInteger(a: uint8/int8, b: int8) → int32.
+    /// Compatible with ONNX MatMulInteger; backed by native int8 kernels in ORT/TRT.
+    MatMulInteger {
+        a: OperandIndex,
+        b: OperandIndex,
+        a_zero_point: Option<OperandIndex>,
+        b_zero_point: Option<OperandIndex>,
+        options: Option<MLOperatorOptions>,
+        outputs: Vec<OperandIndex>,
+    },
 }
 
 /// Legacy graph JSON used a top-level `"label"` on each operation; WebNN places `label` on options.
@@ -1024,6 +1046,8 @@ impl Operation {
             Operation::IsNaN { .. } => "isNaN",
             Operation::IsInfinite { .. } => "isInfinite",
             Operation::RoundEven { .. } => "roundEven",
+            Operation::ConvInteger { .. } => "convInteger",
+            Operation::MatMulInteger { .. } => "matMulInteger",
         }
     }
 
@@ -1222,6 +1246,20 @@ impl Operation {
             Operation::IsNaN { input, .. } => vec![*input],
             Operation::IsInfinite { input, .. } => vec![*input],
             Operation::RoundEven { input, .. } => vec![*input],
+            Operation::ConvInteger {
+                input, filter, input_zero_point, filter_zero_point, ..
+            } => {
+                let mut v = vec![*input, *filter];
+                if let Some(i) = input_zero_point  { v.push(*i); }
+                if let Some(i) = filter_zero_point { v.push(*i); }
+                v
+            }
+            Operation::MatMulInteger { a, b, a_zero_point, b_zero_point, .. } => {
+                let mut v = vec![*a, *b];
+                if let Some(i) = a_zero_point { v.push(*i); }
+                if let Some(i) = b_zero_point { v.push(*i); }
+                v
+            }
         }
     }
 
@@ -1329,6 +1367,8 @@ impl Operation {
             Operation::IsNaN { outputs, .. } => outputs,
             Operation::IsInfinite { outputs, .. } => outputs,
             Operation::RoundEven { outputs, .. } => outputs,
+            Operation::ConvInteger { outputs, .. } => outputs,
+            Operation::MatMulInteger { outputs, .. } => outputs,
         }
     }
 
@@ -1387,7 +1427,12 @@ impl Operation {
             | Operation::GatherND { options, .. }
             | Operation::IsNaN { options, .. }
             | Operation::IsInfinite { options, .. }
-            | Operation::RoundEven { options, .. } => opt_label!(options),
+            | Operation::RoundEven { options, .. }
+            | Operation::MatMulInteger { options, .. } => opt_label!(options),
+
+            Operation::ConvInteger { options, .. } => {
+                options.as_ref().map(|o| o.label.as_str()).unwrap_or("")
+            }
 
             Operation::ArgMin { options, .. } | Operation::ArgMax { options, .. } => {
                 opt_label!(options)
@@ -2226,6 +2271,18 @@ impl Operation {
                 vec![*input],
                 OO::Operator(options.clone().unwrap_or_default()),
             ),
+            Operation::ConvInteger { input, filter, input_zero_point, filter_zero_point, options, .. } => {
+                let mut inputs = vec![*input, *filter];
+                if let Some(i) = input_zero_point  { inputs.push(*i); }
+                if let Some(i) = filter_zero_point { inputs.push(*i); }
+                (tag.clone(), inputs, OO::Conv2d(options.clone().unwrap_or_default()))
+            }
+            Operation::MatMulInteger { a, b, a_zero_point, b_zero_point, options, .. } => {
+                let mut inputs = vec![*a, *b];
+                if let Some(i) = a_zero_point { inputs.push(*i); }
+                if let Some(i) = b_zero_point { inputs.push(*i); }
+                (tag.clone(), inputs, OO::Operator(options.clone().unwrap_or_default()))
+            }
         }
     }
 

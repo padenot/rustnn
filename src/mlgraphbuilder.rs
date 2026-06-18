@@ -1984,6 +1984,65 @@ fn shape_inference_single_output(
         Operation::Gru { .. } | Operation::Lstm { .. } | Operation::LstmCell { .. } => {
             panic!("This method only supports single output ops. Use shape_inference_multi_output")
         }
+        // ConvInteger: integer conv, output dtype is Int32.
+        // We compute output channels from filter[0] directly instead of delegating to
+        // conv2d_shape, which may misbehave on 1D (3D tensor) inputs.
+        Operation::ConvInteger { input, filter, options, .. } => {
+            let input_op = get_operand(MLOperand { id: *input as usize }, graph)?;
+            let filter_op = get_operand(MLOperand { id: *filter as usize }, graph)?;
+            let opts = options.as_ref().cloned().unwrap_or_default();
+            // Output channels = filter.shape[0] (OIHW / OIkH / OI layout).
+            let out_channels = filter_op.descriptor.shape.first().cloned()
+                .unwrap_or(Dimension::Dynamic(crate::graph::DynamicDimension { name: "oc".into(), max_size: 4096 }));
+            // Spatial dims: use conv2d inference if input is 4D, else best-effort from input.
+            let shape = if input_op.descriptor.shape.len() == 4 {
+                match infer_conv2d_shape(
+                    &shape_dims_u32(&input_op.descriptor.shape),
+                    &shape_dims_u32(&filter_op.descriptor.shape),
+                    &opts,
+                ) {
+                    Ok(s) => to_dimension_vector(&s),
+                    Err(_) => input_op.descriptor.shape.clone(),
+                }
+            } else {
+                // 3D input (1D conv): [N, C_in, T] → [N, C_out, T_out]
+                // Use input batch + time dims, replace channels with filter output channels.
+                let n = input_op.descriptor.shape.first().cloned()
+                    .unwrap_or(Dimension::Static(1));
+                let t_in = input_op.descriptor.shape.get(2).cloned();
+                let strides = opts.strides;
+                let t_out = match t_in {
+                    Some(Dimension::Static(t)) => {
+                        let s = strides.first().copied().unwrap_or(1) as u32;
+                        Dimension::Static((t + s - 1) / s) // ceil div
+                    }
+                    other => other.unwrap_or(Dimension::Dynamic(crate::graph::DynamicDimension { name: "t_out".into(), max_size: 4096 })),
+                };
+                vec![n, out_channels, t_out]
+            };
+            Ok(OperandDescriptor { data_type: DataType::Int32, shape, pending_permutation: vec![] })
+        }
+        // MatMulInteger: inputs can be mixed uint8/int8 types; output is always int32.
+        // Shapes may be dynamic at this point (int8 models often have complex reshape chains);
+        // we use a best-effort shape and let ORT resolve exact dims at runtime.
+        Operation::MatMulInteger { a, b, .. } => {
+            let a_op = get_operand(MLOperand { id: *a as usize }, graph)?;
+            let b_op = get_operand(MLOperand { id: *b as usize }, graph)?;
+            // Best effort: [batch..., M, N] where N = last dim of b, M = second-to-last of a.
+            let n = b_op.descriptor.shape.last().cloned()
+                .unwrap_or(Dimension::Dynamic(crate::graph::DynamicDimension { name: "n".to_string(), max_size: 4096 }));
+            let shape = if a_op.descriptor.shape.len() >= 2 {
+                let mut s = a_op.descriptor.shape[..a_op.descriptor.shape.len()-1].to_vec();
+                s.push(n);
+                to_dimension_vector(&s.iter().map(|d| match d {
+                    Dimension::Static(v) => *v as u32,
+                    Dimension::Dynamic(dd) => dd.max_size as u32,
+                }).collect::<Vec<_>>())
+            } else {
+                vec![n]
+            };
+            Ok(OperandDescriptor { data_type: DataType::Int32, shape, pending_permutation: vec![] })
+        }
     }
 }
 
@@ -2361,6 +2420,48 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         input,
         filter
     );
+
+    /// Integer convolution: `input` (uint8) × `filter` (int8) → int32.
+    pub fn conv_integer(
+        &mut self,
+        input: MLOperand,
+        filter: MLOperand,
+        input_zero_point: Option<MLOperand>,
+        filter_zero_point: Option<MLOperand>,
+        options: MLConv2dOptions,
+    ) -> Result<MLOperand> {
+        let output_id = self.graph.as_mut()
+            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?.operands.len() as u32;
+        self.add_single_output_operation(Operation::ConvInteger {
+            input: input.id as OperandIndex,
+            filter: filter.id as OperandIndex,
+            input_zero_point: input_zero_point.map(|o| o.id as OperandIndex),
+            filter_zero_point: filter_zero_point.map(|o| o.id as OperandIndex),
+            options: Some(options),
+            outputs: vec![output_id],
+        })
+    }
+
+    /// Integer matrix multiply: `a` (uint8/int8) × `b` (int8) → int32.
+    pub fn matmul_integer(
+        &mut self,
+        a: MLOperand,
+        b: MLOperand,
+        a_zero_point: Option<MLOperand>,
+        b_zero_point: Option<MLOperand>,
+        options: MLOperatorOptions,
+    ) -> Result<MLOperand> {
+        let output_id = self.graph.as_mut()
+            .ok_or(GraphBuilderError::GraphAlreadyBuilt)?.operands.len() as u32;
+        self.add_single_output_operation(Operation::MatMulInteger {
+            a: a.id as OperandIndex,
+            b: b.id as OperandIndex,
+            a_zero_point: a_zero_point.map(|o| o.id as OperandIndex),
+            b_zero_point: b_zero_point.map(|o| o.id as OperandIndex),
+            options: Some(options),
+            outputs: vec![output_id],
+        })
+    }
 
     pub fn split(&mut self, input: MLOperand, splits: &[u32]) -> Result<Vec<MLOperand>> {
         self.split_with_options(input, splits, MLSplitOptions::default())
