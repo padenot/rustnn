@@ -66,6 +66,10 @@ pub(crate) struct OrtTensor {
 /// Compiled ONNX model held by [`MLGraph`] (mirrors [`crate::executors::trtx::TrtxGraph`]).
 pub(crate) struct OrtGraph {
     pub(crate) session: Session,
+    /// Cached ONNX model bytes — kept for AOT cache writes via `save_ort_graph_cache`.
+    pub(crate) onnx_data: Vec<u8>,
+    /// External weights blob (when model uses external data format).
+    pub(crate) onnx_weights: Option<Vec<u8>>,
 }
 
 impl fmt::Debug for OrtGraph {
@@ -80,6 +84,100 @@ impl fmt::Debug for OrtGraph {
 pub(crate) struct OrtBuilder<'a> {
     graph: Option<&'a GraphInfo>,
     use_cuda: bool,
+}
+
+impl OrtBuilder<'_> {
+    /// Build an ORT session from a file path — ORT memory-maps the ONNX and its external weights.
+    /// The external weights must be named `rustnn_external_weights.data` in the same directory.
+    ///
+    /// `compiled_out`: if `Some(path)`, ORT writes the post-optimization graph there as an `.ort`
+    /// file (skipping re-optimization on future loads via `build_session_from_compiled`).
+    pub(crate) fn build_session_from_file(
+        onnx_path: &std::path::Path,
+        compiled_out: Option<&std::path::Path>,
+    ) -> crate::error::Result<Session> {
+        ensure_ort_initialized().map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let mut builder = Session::builder()
+            .map_err(|e| Error::GraphBuildError { source: format!("session builder: {e}").into() })?
+            .with_optimization_level(GraphOptimizationLevel::All)
+            .map_err(|e| Error::GraphBuildError { source: format!("opt level: {e}").into() })?
+            // Disable memory pattern optimisation: it does a full dry-run forward pass at init
+            // time purely to record allocation sizes, which costs significant boot time. We pay
+            // a small per-inference allocation overhead instead.
+            .with_memory_pattern(false)
+            .map_err(|e| Error::GraphBuildError { source: format!("mem pattern: {e}").into() })?;
+        if let Some(out) = compiled_out {
+            builder = builder.with_optimized_model_path(out)
+                .map_err(|e| Error::GraphBuildError { source: format!("set compiled path: {e}").into() })?;
+        }
+        let mut ep_builder = builder
+            .with_execution_providers([
+                ort::ep::XNNPACK::default().build(),
+                ort::ep::CPUExecutionProvider::default().build(),
+            ])
+            .map_err(|e| Error::GraphBuildError { source: format!("ep: {e}").into() })?;
+
+        let result = ep_builder.commit_from_file(onnx_path);
+        match result {
+            Ok(session) => Ok(session),
+            Err(e) if compiled_out.is_some() => {
+                // Saving the compiled form failed (e.g. protobuf 2GB limit for large fp16 models).
+                // Clean up the partial file and retry without it.
+                log::warn!("ORT compiled-model save failed ({e}); retrying without optimization save");
+                if let Some(out) = compiled_out {
+                    let _ = std::fs::remove_file(out);
+                }
+                Self::build_session_from_file(onnx_path, None)
+            }
+            Err(e) => Err(Error::GraphBuildError { source: format!("commit_from_file: {e}").into() }),
+        }
+    }
+
+    /// Load a pre-compiled `.ort` model — skips graph optimization, much faster boot.
+    pub(crate) fn build_session_from_compiled(compiled_path: &std::path::Path) -> crate::error::Result<Session> {
+        ensure_ort_initialized().map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let mut ep_builder = Session::builder()
+            .map_err(|e| Error::GraphBuildError { source: format!("session builder: {e}").into() })?
+            .with_optimization_level(GraphOptimizationLevel::Disable)
+            .map_err(|e| Error::GraphBuildError { source: format!("opt level: {e}").into() })?
+            .with_memory_pattern(false)
+            .map_err(|e| Error::GraphBuildError { source: format!("mem pattern: {e}").into() })?
+            .with_execution_providers([
+                ort::ep::XNNPACK::default().build(),
+                ort::ep::CPUExecutionProvider::default().build(),
+            ])
+            .map_err(|e| Error::GraphBuildError { source: format!("ep: {e}").into() })?;
+        ep_builder.commit_from_file(compiled_path)
+            .map_err(|e| Error::GraphBuildError { source: format!("commit compiled: {e}").into() })
+    }
+
+    /// Build an ORT session directly from ONNX bytes — used when the model is small or inline.
+    pub(crate) fn build_session_from_bytes(
+        onnx_data: &[u8],
+        onnx_weights: Option<&[u8]>,
+    ) -> crate::error::Result<Session> {
+        ensure_ort_initialized().map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let mut builder = Session::builder()
+            .map_err(|e| Error::GraphBuildError { source: format!("session builder: {e}").into() })?
+            .with_optimization_level(GraphOptimizationLevel::All)
+            .map_err(|e| Error::GraphBuildError { source: format!("opt level: {e}").into() })?;
+        if let Some(weights) = onnx_weights {
+            builder = builder
+                .with_external_initializer_file_in_memory(
+                    ONNX_EXTERNAL_WEIGHTS_FILENAME,
+                    Cow::Owned(weights.to_vec()),
+                )
+                .map_err(|e| Error::GraphBuildError { source: format!("external weights: {e}").into() })?;
+        }
+        let mut ep_builder = builder
+            .with_execution_providers([
+                ort::ep::XNNPACK::default().build(),
+                ort::ep::CPUExecutionProvider::default().build(),
+            ])
+            .map_err(|e| Error::GraphBuildError { source: format!("ep: {e}").into() })?;
+        ep_builder.commit_from_memory(onnx_data)
+            .map_err(|e| Error::GraphBuildError { source: format!("commit: {e}").into() })
+    }
 }
 
 impl fmt::Debug for OrtBuilder<'_> {
@@ -102,7 +200,7 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for OrtBuilder<'co
             .map_err(|e| GraphError::OnnxRuntimeFailed {
                 reason: format!("set opt level failed: {e}"),
             })?;
-        if let Some(weights) = converted.weights_data {
+        if let Some(ref weights) = converted.weights_data {
             builder = builder
                 .with_external_initializer_file_in_memory(
                     ONNX_EXTERNAL_WEIGHTS_FILENAME,
@@ -126,7 +224,10 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for OrtBuilder<'co
                 .map_err(|e| Error::GraphBuildError { source: e.into() })?
         } else {
             ep_builder
-                .with_execution_providers([ort::ep::CPUExecutionProvider::default().build()])
+                .with_execution_providers([
+                    ort::ep::XNNPACK::default().build(),
+                    ort::ep::CPUExecutionProvider::default().build(),
+                ])
                 .map_err(|e| Error::GraphBuildError { source: e.into() })?
         };
         let session = ep_builder
@@ -134,7 +235,11 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for OrtBuilder<'co
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         MLGraph::new(
             crate::mlcontext::MLBackendGraph::OnnxSession(
-                OrtGraph { session },
+                OrtGraph {
+                    session,
+                    onnx_data: converted.data,
+                    onnx_weights: converted.weights_data.map(|w| w.to_vec()),
+                },
                 std::marker::PhantomData,
             ),
             &graph_info,

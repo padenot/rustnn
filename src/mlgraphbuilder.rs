@@ -2065,6 +2065,130 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         self.backend.build(graph)
     }
 
+    /// Extract the accumulated GraphInfo without building a backend session.
+    /// Used for AOT serialization (ONNX → WebNN file) before committing to a backend.
+    pub fn take_graph_info(&mut self) -> Option<GraphInfo> {
+        self.graph.take()
+    }
+
+    /// Build an MLGraph directly from raw ONNX bytes — bypasses the OnnxConverter.
+    /// Used by `load_ort_graph_cache` to skip onnx2webnn conversion at boot.
+    #[cfg(feature = "onnx-runtime")]
+    pub fn build_from_onnx_bytes(
+        &mut self,
+        onnx_data: Vec<u8>,
+        onnx_weights: Option<Vec<u8>>,
+        graph_info: crate::GraphInfo,
+    ) -> crate::error::Result<MLGraph<'context>> {
+        use crate::backends::ort::{OrtBuilder, OrtGraph};
+        use crate::mlcontext::MLBackendGraph;
+        use crate::executors::onnx::ensure_ort_initialized;
+
+        let session = OrtBuilder::build_session_from_bytes(&onnx_data, onnx_weights.as_deref())?;
+
+        // I/O descriptors from ORT type info — same logic as load_ort_graph_cache.
+        fn ort_ty(ty: ort::value::TensorElementType) -> crate::graph::DataType {
+            use ort::value::TensorElementType;
+            use crate::graph::DataType;
+            match ty {
+                TensorElementType::Float32 => DataType::Float32,
+                TensorElementType::Float16 => DataType::Float16,
+                TensorElementType::Int32   => DataType::Int32,
+                TensorElementType::Uint32  => DataType::Uint32,
+                TensorElementType::Int64   => DataType::Int64,
+                TensorElementType::Uint64  => DataType::Uint64,
+                TensorElementType::Int8    => DataType::Int8,
+                TensorElementType::Uint8   => DataType::Uint8,
+                _                          => DataType::Float32,
+            }
+        }
+        fn ort_dims(shape: &[i64]) -> Vec<crate::graph::Dimension> {
+            use crate::graph::{Dimension, DynamicDimension};
+            shape.iter().map(|&d| {
+                if d >= 0 { Dimension::Static(d as u32) }
+                else { Dimension::Dynamic(DynamicDimension { max_size: 0, name: String::new() }) }
+            }).collect()
+        }
+        let mut input_descriptors = std::collections::HashMap::new();
+        let mut output_descriptors = std::collections::HashMap::new();
+        for outlet in session.inputs().iter() {
+            if let ort::value::ValueType::Tensor { ty, shape, .. } = outlet.dtype() {
+                input_descriptors.insert(outlet.name().to_string(), OperandDescriptor {
+                    data_type: ort_ty(*ty), shape: ort_dims(shape), pending_permutation: vec![],
+                });
+            }
+        }
+        for outlet in session.outputs().iter() {
+            if let ort::value::ValueType::Tensor { ty, shape, .. } = outlet.dtype() {
+                output_descriptors.insert(outlet.name().to_string(), OperandDescriptor {
+                    data_type: ort_ty(*ty), shape: ort_dims(shape), pending_permutation: vec![],
+                });
+            }
+        }
+
+        let mut ml_graph = MLGraph::new(
+            MLBackendGraph::OnnxSession(
+                OrtGraph { session, onnx_data, onnx_weights },
+                std::marker::PhantomData,
+            ),
+            &graph_info,
+        )?;
+        ml_graph.input_descriptors = input_descriptors;
+        ml_graph.output_descriptors = output_descriptors;
+        Ok(ml_graph)
+    }
+
+    /// Mark outputs and return the finalized GraphInfo without running any backend.
+    /// Equivalent to the first half of build() — use this for AOT serialization.
+    pub fn finalize_to_graph_info(
+        &mut self,
+        outputs: &HashMap<&str, MLOperand>,
+    ) -> crate::error::Result<GraphInfo> {
+        if outputs.is_empty() {
+            return Err(GraphBuilderError::EmptyOutputHashMap.into());
+        }
+        let mut graph = self.graph.take().ok_or(GraphBuilderError::GraphAlreadyBuilt)?;
+
+        let mut duplicates = HashMap::<MLOperand, &str>::new();
+        for (name, operand) in outputs.iter() {
+            match duplicates.entry(*operand) {
+                std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+                    return Err(GraphBuilderError::DuplicateOutput {
+                        operand: *operand,
+                        first_name: occupied_entry.get().to_string(),
+                        second_name: name.to_string(),
+                    }.into());
+                }
+                std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(name);
+                }
+            }
+            if let Some(op) = graph.operands.get_mut(operand.id) {
+                if op.kind == OperandKind::Input {
+                    return Err(GraphBuilderError::RequestedInputAsOutput {
+                        operand: op.clone(),
+                        id: operand.id,
+                    }.into());
+                } else if op.kind == OperandKind::Constant {
+                    return Err(GraphBuilderError::RequestedConstantAsOutput {
+                        operand: op.clone(),
+                        id: operand.id,
+                    }.into());
+                }
+                op.kind = OperandKind::Output;
+                op.name = Some(name.to_string());
+            } else {
+                return Err(GraphBuilderError::BuildWithInvalidOperand {
+                    operand: *operand,
+                    name: name.to_string(),
+                }.into());
+            }
+            graph.output_operands.push(operand.id as u32);
+        }
+        graph.output_operands.sort_unstable();
+        Ok(graph)
+    }
+
     /*async*/
     pub fn build(
         &mut self,

@@ -97,8 +97,29 @@ pub fn graph_operation_to_webnn_node(
         })?;
     let id = format!("op_{}", op_index);
 
-    let input_names: Vec<String> = operation
-        .input_operands()
+    // Start with the declared input operands.
+    let mut input_idx_list: Vec<u32> = operation.input_operands().to_vec();
+
+    // Some ops store optional operand references (scale, bias, etc.) as option fields rather
+    // than as positional input_operands. Append them so the round-trip through the text format
+    // works: from_operator_options reads them back as positional inputs (indices 1, 2, ...).
+    fn push_opt_operand(list: &mut Vec<u32>, opts: &serde_json::Value, key: &str) {
+        if let Some(serde_json::Value::Number(n)) = opts.get(key) {
+            if let Some(idx) = n.as_u64() {
+                list.push(idx as u32);
+            }
+        }
+    }
+    let raw_attrs = operation.attributes_value();
+    match operation.op_type() {
+        "layerNormalization" | "instanceNormalization" | "batchNormalization" => {
+            push_opt_operand(&mut input_idx_list, &raw_attrs, "scale");
+            push_opt_operand(&mut input_idx_list, &raw_attrs, "bias");
+        }
+        _ => {}
+    }
+
+    let input_names: Vec<String> = input_idx_list
         .iter()
         .map(|&idx| {
             graph.operands[idx as usize]
@@ -131,6 +152,37 @@ pub fn graph_operation_to_webnn_node(
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
     options.remove("kind");
+
+    // Cast's target data_type is stored in the op struct, not in attributes_value().
+    // Add it as "to" in the options so it round-trips correctly.
+    if operation.op_type() == "cast" {
+        if let crate::operators::Operation::Cast { data_type, .. } = operation {
+            use crate::MLOperandDataType;
+            let dt_str = match data_type {
+                MLOperandDataType::Float32 => "float32",
+                MLOperandDataType::Float16 => "float16",
+                MLOperandDataType::Int32 => "int32",
+                MLOperandDataType::Uint32 => "uint32",
+                MLOperandDataType::Int64 => "int64",
+                MLOperandDataType::Uint64 => "uint64",
+                MLOperandDataType::Int8 => "int8",
+                MLOperandDataType::Uint8 => "uint8",
+                _ => "float32",
+            };
+            options.insert("to".to_string(), serde_json::Value::String(dt_str.to_string()));
+        }
+    }
+
+    // Remove operand-index fields from options — emitted as positional inputs above.
+    // Leaving them as raw integers breaks deserialization (u32 parse fails for strings).
+    for key in &["scale", "bias", "recurrentBias", "recurrent_bias",
+                 "initialHiddenState", "initial_hidden_state",
+                 "initialCellState", "initial_cell_state",
+                 "peepholeWeight", "peephole_weight", "c"] {
+        if matches!(options.get(*key), Some(serde_json::Value::Number(_))) {
+            options.remove(*key);
+        }
+    }
 
     Ok(Node {
         id,
@@ -199,7 +251,7 @@ pub fn to_graph_json(graph: &GraphInfo, quantized: bool) -> Result<GraphJson, Gr
                 }
             }
             OperandKind::Intermediate => {
-                // Intermediates are not in graph json
+                // Shapes collected separately in intermediate_shapes below
             }
             OperandKind::Output => {
                 // Outputs are handled separately below
@@ -223,6 +275,23 @@ pub fn to_graph_json(graph: &GraphInfo, quantized: bool) -> Result<GraphJson, Gr
         }
     }
 
+    // Collect intermediate (and output) operand shapes for lossless round-trip.
+    // Without this, from_graph_json must re-infer shapes, which fails for ops like conv2d.
+    let mut intermediate_shapes = BTreeMap::new();
+    for (idx, operand) in graph.operands.iter().enumerate() {
+        if !matches!(operand.kind, OperandKind::Intermediate | OperandKind::Output) {
+            continue;
+        }
+        if operand.descriptor.shape.is_empty() {
+            continue; // skip truly unknown shapes
+        }
+        let name = operand.name.clone().unwrap_or_else(|| format!("operand_{}", idx));
+        intermediate_shapes.insert(name, OperandDesc {
+            data_type: to_webnn_datatype(&operand.descriptor.data_type),
+            shape: operand.descriptor.shape.iter().map(to_webnn_dimension).collect(),
+        });
+    }
+
     Ok(GraphJson {
         name: Some("graph".to_string()),
         format: "webnn-graph-json".to_string(),
@@ -232,6 +301,7 @@ pub fn to_graph_json(graph: &GraphInfo, quantized: bool) -> Result<GraphJson, Gr
         consts,
         nodes,
         outputs,
+        intermediate_shapes,
     })
 }
 
@@ -429,8 +499,22 @@ pub fn from_graph_json(graph_json: &GraphJson) -> Result<GraphInfo, GraphError> 
         quantized: graph_json.quantized,
     };
 
-    // Run shape inference pass to fill in output shapes
-    infer_output_shapes(&mut graph_info)?;
+    if graph_json.intermediate_shapes.is_empty() {
+        // No authoritative shapes: run inference to fill in what we can.
+        infer_output_shapes(&mut graph_info)?;
+    } else {
+        // intermediate_shapes is authoritative — apply it directly, skip inference.
+        // inference would overwrite correct types/shapes with wrong inferences for
+        // ops not fully supported (conv2d, etc.).
+        for (name, desc) in &graph_json.intermediate_shapes {
+            if let Some(&idx) = operand_map.get(name) {
+                if let Some(op) = graph_info.operands.get_mut(idx as usize) {
+                    op.descriptor.data_type = from_webnn_datatype(&desc.data_type);
+                    op.descriptor.shape = desc.shape.iter().map(from_webnn_dimension).collect();
+                }
+            }
+        }
+    }
 
     Ok(graph_info)
 }
@@ -574,7 +658,10 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                 "add" | "sub" | "mul" | "div" | "pow" | "max" | "min" | "greater"
                 | "greaterorequal" | "less" | "lesser" | "lessorequal" | "lesserorequal"
                 | "equal" | "notequal" | "logical_and" | "logical_or" | "logical_xor" => {
-                    if input_shapes.len() >= 2 {
+                    if input_shapes.len() >= 2
+                        && !input_shapes[0].is_empty()
+                        && !input_shapes[1].is_empty()
+                    {
                         broadcast_shapes_dimensions(&input_shapes[0], &input_shapes[1]).ok()
                     } else {
                         None
@@ -589,7 +676,7 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                 | "isinfinite" | "quantizelinear" | "dequantizelinear"
                 // Normalization ops preserve the input tensor rank and extents.
                 | "batchnormalization" | "instancenormalization" | "layernormalization" => {
-                    input_shapes.first().cloned()
+                    input_shapes.first().filter(|s| !s.is_empty()).cloned()
                 }
                 "grucell" | "gru_cell" => {
                     if let Some(hidden_state_shape) = input_shapes.get(3) {

@@ -21,7 +21,7 @@ use crate::runtime_checks::{RuntimeShapeState, TensorKind, validate_shape_data_l
 
 static INIT: Once = Once::new();
 
-pub(crate) fn ensure_ort_initialized() -> Result<(), GraphError> {
+pub fn ensure_ort_initialized() -> Result<(), GraphError> {
     let mut result = Ok(());
     INIT.call_once(|| {
         info!("Loading onnxruntime");
@@ -939,6 +939,244 @@ pub fn run_onnx_with_bindings(
     Err(GraphError::DeviceTensorFailed {
         reason: "IoBinding not yet implemented - use dispatch() instead".to_string(),
     })
+}
+
+/// Save an MLGraph's ORT backend to disk as an AOT cache for fast subsequent loading.
+///
+/// Writes the ONNX protobuf to `onnx_path` and the external weights (if any) as
+/// `rustnn_external_weights.data` in the same directory. On subsequent runs pass `onnx_path`
+/// to `load_ort_graph_cache` — ORT will memory-map the weights rather than reading them into RAM.
+pub fn save_ort_graph_cache(
+    graph: &crate::MLGraph,
+    onnx_path: &std::path::Path,
+) -> Result<(), GraphError> {
+    use prost::Message;
+
+    let g = graph.backend.as_onnx_session().ok_or_else(|| GraphError::OnnxRuntimeFailed {
+        reason: "graph is not an ORT session — cannot save ORT cache".to_string(),
+    })?;
+
+    if let Some(weights) = &g.onnx_weights {
+        // Use a model-specific weights filename so multiple models can share a directory.
+        let stem = onnx_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+        let weights_filename = format!("{stem}.weights");
+        let weights_path = onnx_path.parent().unwrap_or(std::path::Path::new("."))
+            .join(&weights_filename);
+
+        // Patch the ONNX protobuf: replace the generic ONNX_EXTERNAL_WEIGHTS_FILENAME
+        // with our model-specific name so models in the same directory don't collide.
+        let mut model = crate::protos::onnx::ModelProto::decode(g.onnx_data.as_slice())
+            .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("parse onnx: {e}") })?;
+        if let Some(ref mut graph_proto) = model.graph {
+            for init in &mut graph_proto.initializer {
+                if init.data_location == 1 {
+                    for kv in &mut init.external_data {
+                        if kv.key == "location" && kv.value == ONNX_EXTERNAL_WEIGHTS_FILENAME {
+                            kv.value = weights_filename.clone();
+                        }
+                    }
+                }
+            }
+        }
+        let patched = model.encode_to_vec();
+        std::fs::write(onnx_path, &patched)
+            .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("write onnx cache: {e}") })?;
+        std::fs::write(&weights_path, weights)
+            .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("write weights cache: {e}") })?;
+    } else {
+        std::fs::write(onnx_path, &g.onnx_data)
+            .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("write onnx cache: {e}") })?;
+    }
+    Ok(())
+}
+
+/// Save the compiled (post-optimization) form of the graph for fast subsequent loading.
+///
+/// For the ORT backend this writes an `.ort` file — subsequent calls to `load_compiled_graph`
+/// on that file skip ORT's graph optimization pass entirely, reducing boot time significantly.
+/// Other backends will use their own format (CoreML → `.mlmodelc`, RTR-RTX → TBD).
+pub fn save_compiled_graph(
+    graph: &crate::MLGraph,
+    compiled_path: &std::path::Path,
+) -> Result<(), GraphError> {
+    let g = graph.backend.as_onnx_session().ok_or_else(|| GraphError::OnnxRuntimeFailed {
+        reason: "save_compiled_graph: backend is not ORT (CoreML/RTR-RTX not yet implemented)".into(),
+    })?;
+    // Re-run the session builder with compiled_out so ORT writes the optimized model.
+    // We need the original ONNX path — it's the last committed file, which ORT knows internally
+    // but doesn't expose. Instead, call with_optimized_model_path on a fresh build from the
+    // same data that created this session. Since we stored the ONNX bytes in OrtGraph, use those.
+    if g.onnx_data.is_empty() {
+        return Err(GraphError::OnnxRuntimeFailed {
+            reason: "save_compiled_graph: no ONNX bytes stored (was this loaded from a file cache?)".into(),
+        });
+    }
+    ensure_ort_initialized()?;
+    use crate::backends::ort::OrtBuilder;
+    // Build a temporary session solely to trigger ORT's optimized model write.
+    // Disable EPs that aren't relevant; just need the optimization pass to run.
+    let weights_ref = g.onnx_weights.as_deref();
+    let mut builder = ort::session::Session::builder()
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("{e}") })?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::All)
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("{e}") })?
+        .with_optimized_model_path(compiled_path)
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("{e}") })?;
+    if let Some(w) = weights_ref {
+        builder = builder
+            .with_external_initializer_file_in_memory(
+                ONNX_EXTERNAL_WEIGHTS_FILENAME,
+                std::borrow::Cow::Owned(w.to_vec()),
+            )
+            .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("{e}") })?;
+    }
+    builder.commit_from_memory(&g.onnx_data)
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("build for compile: {e}") })?;
+    Ok(())
+}
+
+/// Load a compiled graph produced by `save_compiled_graph`, skipping all compilation steps.
+///
+/// Detects the backend from the file extension:
+/// - `.ort` → ORT compiled model (no graph optimization pass)
+/// - `.mlmodelc` → CoreML compiled model (not yet implemented)
+///
+/// Returns `(MLContext, MLGraph)` ready for `dispatch()`.
+pub fn load_compiled_graph(
+    compiled_path: &std::path::Path,
+    accelerated: bool,
+) -> Result<(crate::mlcontext::MLContext<'static>, crate::MLGraph<'static>), GraphError> {
+    let name = compiled_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // .opt.onnx = ORT-optimized ONNX (load with Disable to skip re-optimization)
+    // .ort      = ORT binary format (if/when supported)
+    // .mlmodelc = CoreML compiled (future)
+    if name.ends_with(".opt.onnx") || name.ends_with(".ort") {
+        load_ort_compiled(compiled_path, accelerated)
+    } else {
+        Err(GraphError::OnnxRuntimeFailed {
+            reason: format!("load_compiled_graph: unsupported format for '{name}' (expected .opt.onnx, .ort, .mlmodelc)"),
+        })
+    }
+}
+
+fn load_ort_compiled(
+    compiled_path: &std::path::Path,
+    accelerated: bool,
+) -> Result<(crate::mlcontext::MLContext<'static>, crate::MLGraph<'static>), GraphError> {
+    use crate::backends::ort::{OrtBuilder, OrtGraph};
+    use crate::mlcontext::{MLContext, MLContextOptions, MLBackendGraph, MLPowerPreference};
+    use crate::graph::{DataType, Dimension, DynamicDimension, GraphInfo, OperandDescriptor};
+
+    ensure_ort_initialized()?;
+    let session = OrtBuilder::build_session_from_compiled(compiled_path)
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("load compiled: {e}") })?;
+
+    let (input_descriptors, output_descriptors) = ort_session_io_descriptors(&session);
+
+    let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, accelerated))
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("create context: {e}") })?;
+
+    let mut graph = crate::MLGraph::new(
+        MLBackendGraph::OnnxSession(
+            OrtGraph { session, onnx_data: Vec::new(), onnx_weights: None },
+            std::marker::PhantomData,
+        ),
+        &GraphInfo::default(),
+    ).map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("wrap graph: {e}") })?;
+
+    graph.input_descriptors = input_descriptors;
+    graph.output_descriptors = output_descriptors;
+    Ok((context, graph))
+}
+
+/// Load an MLGraph from an AOT cache file produced by `save_ort_graph_cache`.
+///
+/// ORT memory-maps the ONNX and discovers `rustnn_external_weights.data` in the same directory
+/// — no heap copy of the weight blob. Returns `(MLContext, MLGraph)` ready for `dispatch()`.
+pub fn load_ort_graph_cache(
+    onnx_path: &std::path::Path,
+    accelerated: bool,
+) -> Result<(crate::mlcontext::MLContext<'static>, crate::MLGraph<'static>), GraphError> {
+    use crate::backends::ort::{OrtBuilder, OrtGraph};
+    use crate::mlcontext::{MLContext, MLContextOptions, MLBackendGraph, MLPowerPreference};
+    use crate::graph::GraphInfo;
+
+    ensure_ort_initialized()?;
+
+    // If no optimized model exists yet, produce it so the next load skips graph optimization.
+    // Use `.opt.onnx` suffix — ORT saves optimized ONNX (smaller search space on reload).
+    let compiled_path = {
+        let stem = onnx_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
+        onnx_path.with_file_name(format!("{stem}.opt.onnx"))
+    };
+    let compiled_out = if compiled_path.exists() { None } else { Some(compiled_path.as_path()) };
+
+    let session = OrtBuilder::build_session_from_file(onnx_path, compiled_out)
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("build session: {e}") })?;
+
+    let (input_descriptors, output_descriptors) = ort_session_io_descriptors(&session);
+
+    let mut context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, accelerated))
+        .map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("create context: {e}") })?;
+
+    let mut graph = crate::MLGraph::new(
+        MLBackendGraph::OnnxSession(
+            OrtGraph { session, onnx_data: Vec::new(), onnx_weights: None },
+            std::marker::PhantomData,
+        ),
+        &GraphInfo::default(),
+    ).map_err(|e| GraphError::OnnxRuntimeFailed { reason: format!("wrap graph: {e}") })?;
+
+    graph.input_descriptors = input_descriptors;
+    graph.output_descriptors = output_descriptors;
+    Ok((context, graph))
+}
+
+/// Extract input/output descriptors from an ORT session's type info.
+fn ort_session_io_descriptors(
+    session: &ort::session::Session,
+) -> (std::collections::HashMap<String, crate::graph::OperandDescriptor>,
+      std::collections::HashMap<String, crate::graph::OperandDescriptor>)
+{
+    use crate::graph::{DataType, Dimension, DynamicDimension, OperandDescriptor};
+    fn ort_ty(ty: ort::value::TensorElementType) -> DataType {
+        use ort::value::TensorElementType;
+        match ty {
+            TensorElementType::Float32 => DataType::Float32,
+            TensorElementType::Float16 => DataType::Float16,
+            TensorElementType::Int32   => DataType::Int32,
+            TensorElementType::Uint32  => DataType::Uint32,
+            TensorElementType::Int64   => DataType::Int64,
+            TensorElementType::Uint64  => DataType::Uint64,
+            TensorElementType::Int8    => DataType::Int8,
+            TensorElementType::Uint8   => DataType::Uint8,
+            _                          => DataType::Float32,
+        }
+    }
+    fn ort_dims(shape: &[i64]) -> Vec<Dimension> {
+        shape.iter().map(|&d| if d >= 0 {
+            Dimension::Static(d as u32)
+        } else {
+            Dimension::Dynamic(DynamicDimension { max_size: 0, name: String::new() })
+        }).collect()
+    }
+    let mut inputs = std::collections::HashMap::new();
+    let mut outputs = std::collections::HashMap::new();
+    for o in session.inputs().iter() {
+        if let ort::value::ValueType::Tensor { ty, shape, .. } = o.dtype() {
+            inputs.insert(o.name().to_string(), OperandDescriptor {
+                data_type: ort_ty(*ty), shape: ort_dims(shape), pending_permutation: vec![],
+            });
+        }
+    }
+    for o in session.outputs().iter() {
+        if let ort::value::ValueType::Tensor { ty, shape, .. } = o.dtype() {
+            outputs.insert(o.name().to_string(), OperandDescriptor {
+                data_type: ort_ty(*ty), shape: ort_dims(shape), pending_permutation: vec![],
+            });
+        }
+    }
+    (inputs, outputs)
 }
 
 #[cfg(test)]

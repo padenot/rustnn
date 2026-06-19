@@ -33,6 +33,8 @@ pub use error::GraphError;
 pub use executors::onnx::{
     OnnxInput, OnnxOutput, OnnxOutputWithData, OrtSession, TensorData,
     load_webnn_as_ort_session, run_onnx_with_inputs, run_onnx_with_inputs_checked, run_onnx_zeroed,
+    save_ort_graph_cache, load_ort_graph_cache,
+    save_compiled_graph, load_compiled_graph,
 };
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 pub use executors::trtx::{

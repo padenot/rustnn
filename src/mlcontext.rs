@@ -96,6 +96,14 @@ impl<'context> MLBackendGraph<'context> {
             _ => None,
         }
     }
+
+    #[cfg(feature = "onnx-runtime")]
+    pub(crate) fn as_onnx_session(&self) -> Option<&crate::backends::ort::OrtGraph> {
+        match self {
+            Self::OnnxSession(g, _) => Some(g),
+            _ => None,
+        }
+    }
 }
 
 // types for MLContext
