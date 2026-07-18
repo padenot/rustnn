@@ -3717,12 +3717,10 @@ dependencies = [
  "half",
  "pest",
  "pest_derive",
- "prost",
  "safetensors",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "webnn-onnx-utils",
 ]
 
 [[package]]

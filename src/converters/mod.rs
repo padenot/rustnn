@@ -6,7 +6,13 @@ use crate::graph::GraphInfo;
 mod coreml_mlprogram;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
+#[cfg(feature = "onnx-converter")]
 pub mod onnx;
+#[cfg(any(
+    feature = "onnx-converter",
+    feature = "trtx-runtime-mock",
+    feature = "trtx-runtime"
+))]
 mod pool2d_shared;
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 mod trtx;
@@ -21,6 +27,7 @@ mod weight_file_builder;
 pub use coreml_mlprogram::CoremlMlProgramConverter;
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;
+#[cfg(feature = "onnx-converter")]
 pub use onnx::OnnxConverter;
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 pub use trtx::TrtxConverter;
@@ -66,6 +73,7 @@ impl ConverterRegistry {
         let mut registry = Self {
             converters: HashMap::new(),
         };
+        #[cfg(feature = "onnx-converter")]
         registry.register(Box::new(OnnxConverter));
         registry.register(Box::new(CoremlMlProgramConverter));
         #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
@@ -159,10 +167,11 @@ mod tests {
         let registry = ConverterRegistry::with_defaults();
         let formats = registry.available_formats();
 
-        // Should have at least ONNX and CoreML converters
-        assert!(formats.contains(&"onnx"));
         assert!(formats.contains(&"coreml"));
-        assert!(formats.len() >= 2);
+        #[cfg(feature = "onnx-converter")]
+        assert!(formats.contains(&"onnx"));
+        #[cfg(not(feature = "onnx-converter"))]
+        assert!(!formats.contains(&"onnx"));
     }
 
     #[test]

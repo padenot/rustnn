@@ -27,10 +27,11 @@ exclude = [
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [features]
-default = []
+default = ["onnx-converter"]
 dynamic-inputs = []
 coreml-runtime = ["objc", "block"]
-onnx-runtime = ["ort", "ndarray"]
+onnx-converter = ["dep:webnn-onnx-utils"]
+onnx-runtime = ["onnx-converter", "ort", "ndarray"]
 trtx-runtime = ["trtx", "cudarc", "zstd-cache-compression"]
 trtx-runtime-mock = ["trtx/mock", "cudarc"]
 litert-runtime = ["litert", "litert-sys", "dep:flatbuffers"]
@@ -64,8 +65,8 @@ litert = { version = "0.2.1", optional = true }
 litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
-webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main" }
-webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main" }
+webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main", default-features = false }
+webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main", optional = true }
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
