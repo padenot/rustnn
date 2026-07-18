@@ -166,6 +166,9 @@ pub enum GraphBuilderError {
         operand_kind: &'static str,
     },
 
+    #[error("Cannot compile a graph created without an execution backend")]
+    MissingExecutionBackend,
+
     // TODO: this should not be needed, instead GraphInfo should ensure via methods to be always consistent
     // and impossible to construct invalid variants
     #[error("Internal error: inconsistent GraphInfo: {message}")]

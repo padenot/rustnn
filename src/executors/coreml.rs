@@ -171,8 +171,7 @@ pub fn run_coreml_with_inputs_checked(
 /// A CoreML model that has been compiled and loaded once, ready for repeated dispatch.
 ///
 /// Owns a retained `MLModel` and the in-memory CoreML asset backing it. All are
-/// released when the value is dropped. This type is intentionally not `Send`/`Sync`:
-/// `MLGraph`/`MLContext` are single-threaded, matching CoreML's usage model.
+/// released when the value is dropped.
 pub(crate) struct CompiledCoremlModel {
     /// Retained `MLModel` Objective-C object.
     model: *mut Object,
@@ -180,6 +179,14 @@ pub(crate) struct CompiledCoremlModel {
     compute_unit: &'static str,
     backing: CoremlModelBacking,
 }
+
+// Apple documents that an MLModel may be used from different threads as long as calls to the
+// model are serialized:
+// https://developer.apple.com/documentation/coreml/mlmodel
+// `CompiledCoremlModel` deliberately remains !Sync, while Send allows an owning MLGraph to move
+// between threads or be protected by a Mutex. All retained Objective-C objects and their backing
+// storage move and drop together with this value.
+unsafe impl Send for CompiledCoremlModel {}
 
 enum CoremlModelBacking {
     InMemory {
@@ -1953,7 +1960,14 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod temp_model_tests {
-    use super::{TempModelSource, write_temp_model_with_weights};
+    use super::{CompiledCoremlModel, TempModelSource, write_temp_model_with_weights};
+
+    #[test]
+    fn compiled_model_can_move_between_serialized_callers() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<CompiledCoremlModel>();
+    }
 
     #[test]
     fn bare_model_writes_mlmodel_file_and_cleans_up_on_drop() {
