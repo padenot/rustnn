@@ -188,6 +188,29 @@ pub(crate) struct CompiledCoremlModel {
 // storage move and drop together with this value.
 unsafe impl Send for CompiledCoremlModel {}
 
+/// A retained Objective-C object transferred across the CoreML shim boundary.
+struct RetainedObjcObject(*mut Object);
+
+impl RetainedObjcObject {
+    fn new(object: *mut Object) -> Self {
+        Self(object)
+    }
+
+    fn as_ptr(&self) -> *mut Object {
+        self.0
+    }
+}
+
+impl Drop for RetainedObjcObject {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _: () = msg_send![self.0, release];
+            }
+        }
+    }
+}
+
 enum CoremlModelBacking {
     InMemory {
         /// Retained `MLModelAsset`. CoreML may refer to it after loading.
@@ -519,12 +542,13 @@ pub(crate) fn run_coreml_bytes(
                 reason: ns_error_to_string(create_error, "MLDictionaryFeatureProvider init failed"),
             });
         }
+        let provider = RetainedObjcObject::new(provider);
 
         let mut output_provider: *mut Object = ptr::null_mut();
         let mut error = [0u8; 1024];
         let status = rustnn_coreml_predict(
             model.model,
-            provider,
+            provider.as_ptr(),
             &mut output_provider,
             error.as_mut_ptr().cast(),
             error.len(),
@@ -534,11 +558,12 @@ pub(crate) fn run_coreml_bytes(
                 reason: format!("prediction failed: {}", shim_error_to_string(&error)),
             });
         }
+        let output_provider = RetainedObjcObject::new(output_provider);
 
         let mut result = HashMap::with_capacity(output_descriptors.len());
         for (name, descriptor) in output_descriptors {
             let key = nsstring_from_str(name)?;
-            let value: *mut Object = msg_send![output_provider, featureValueForName: key];
+            let value: *mut Object = msg_send![output_provider.as_ptr(), featureValueForName: key];
             if value.is_null() {
                 return Err(GraphError::CoremlRuntimeFailed {
                     reason: format!("model did not produce output `{name}`"),
@@ -1112,12 +1137,13 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
+            let provider = RetainedObjcObject::new(provider);
 
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_predict(
                 model,
-                provider,
+                provider.as_ptr(),
                 &mut output_provider,
                 error.as_mut_ptr().cast(),
                 error.len(),
@@ -1132,8 +1158,9 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
+            let output_provider = RetainedObjcObject::new(output_provider);
 
-            match collect_outputs(output_provider) {
+            match collect_outputs(output_provider.as_ptr()) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),
@@ -1293,12 +1320,13 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            let provider = RetainedObjcObject::new(provider);
 
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_predict(
                 model,
-                provider,
+                provider.as_ptr(),
                 &mut output_provider,
                 error.as_mut_ptr().cast(),
                 error.len(),
@@ -1313,8 +1341,9 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            let output_provider = RetainedObjcObject::new(output_provider);
 
-            match collect_outputs(output_provider) {
+            match collect_outputs(output_provider.as_ptr()) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
                     compute_unit: name,
                     result: Ok(outputs),

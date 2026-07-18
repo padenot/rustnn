@@ -88,8 +88,8 @@ int rustnn_coreml_load(void *compiled_url, void *config, void **out_model, char 
     }
 }
 
-// Run a prediction. On success `*out_provider` is a borrowed (autoreleased)
-// output feature provider valid for the caller's current autorelease pool.
+// Run a prediction. On success `*out_provider` owns a retained output feature
+// provider. The caller must release it after collecting the outputs.
 int rustnn_coreml_predict(void *model, void *features, void **out_provider, char *err,
                           size_t err_len) {
     *out_provider = NULL;
@@ -103,7 +103,7 @@ int rustnn_coreml_predict(void *model, void *features, void **out_provider, char
                             nserr ? [nserr localizedDescription] : @"prediction returned nil");
             return 1;
         }
-        *out_provider = (__bridge void *)out;
+        *out_provider = (__bridge_retained void *)out;
         return 0;
     } @catch (NSException *e) {
         rustnn_copy_err(err, err_len,
