@@ -1415,7 +1415,7 @@ fn shape_inference_multi_output(
 }
 
 #[expect(unused_variables)]
-fn shape_inference_single_output(
+pub(crate) fn shape_inference_single_output(
     operation: &Operation,
     graph: &GraphInfo,
 ) -> Result<OperandDescriptor> {

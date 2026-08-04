@@ -119,7 +119,8 @@ pub fn graph_operation_to_webnn_node(
     graph: &GraphInfo,
     op_index: usize,
 ) -> Result<Node, GraphError> {
-    graph_operation_to_webnn_node_with_overrides(graph, op_index, None)
+    let operand_ids = serialized_operand_ids(graph, None)?;
+    graph_operation_to_webnn_node_with_overrides(graph, op_index, None, &operand_ids)
 }
 
 /// Same as [`graph_operation_to_webnn_node`], but operand names can be overridden (see
@@ -128,6 +129,7 @@ fn graph_operation_to_webnn_node_with_overrides(
     graph: &GraphInfo,
     op_index: usize,
     overrides: Option<&OutputNameOverrides>,
+    serialized_operand_ids: &HashMap<u32, u32>,
 ) -> Result<Node, GraphError> {
     let operation = graph
         .operations
@@ -169,11 +171,44 @@ fn graph_operation_to_webnn_node_with_overrides(
     };
 
     let mut options: serde_json::Map<String, serde_json::Value> = operation
-        .attributes_value()
+        .attributes_json_value()
         .as_object()
         .cloned()
         .unwrap_or_else(serde_json::Map::new);
     options.remove("kind");
+    for key in option_operand_keys(operation) {
+        let Some(value) = options.get_mut(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        let old_id = value.as_u64().ok_or_else(|| GraphError::ConversionFailed {
+            format: "webnn-graph-json".to_string(),
+            reason: format!(
+                "operation {} option '{key}' is not an operand index: {value}",
+                operation.op_type()
+            ),
+        })?;
+        let old_id = u32::try_from(old_id).map_err(|_| GraphError::ConversionFailed {
+            format: "webnn-graph-json".to_string(),
+            reason: format!(
+                "operation {} option '{key}' operand index {old_id} exceeds u32",
+                operation.op_type()
+            ),
+        })?;
+        let new_id =
+            serialized_operand_ids
+                .get(&old_id)
+                .ok_or_else(|| GraphError::ConversionFailed {
+                    format: "webnn-graph-json".to_string(),
+                    reason: format!(
+                        "operation {} option '{key}' references missing operand {old_id}",
+                        operation.op_type()
+                    ),
+                })?;
+        *value = serde_json::Value::from(*new_id);
+    }
 
     Ok(Node {
         id,
@@ -182,6 +217,97 @@ fn graph_operation_to_webnn_node_with_overrides(
         options,
         outputs: output_names,
     })
+}
+
+fn option_operand_keys(operation: &Operation) -> &'static [&'static str] {
+    match operation {
+        Operation::BatchNormalization { .. }
+        | Operation::InstanceNormalization { .. }
+        | Operation::LayerNormalization { .. } => &["scale", "bias"],
+        Operation::Conv2d { .. } | Operation::ConvTranspose2d { .. } => &["bias"],
+        Operation::Gemm { .. } => &["c"],
+        Operation::Gru { .. } => &["bias", "recurrentBias", "initialHiddenState"],
+        Operation::GruCell { .. } => &["bias", "recurrentBias"],
+        Operation::Lstm { .. } => &[
+            "bias",
+            "recurrentBias",
+            "peepholeWeight",
+            "initialHiddenState",
+            "initialCellState",
+        ],
+        Operation::LstmCell { .. } => &["bias", "recurrentBias", "peepholeWeight"],
+        _ => &[],
+    }
+}
+
+/// Map source operand ids to the ids assigned by [`from_graph_json`].
+///
+/// The text format stores optional operand references inside operation options
+/// as numeric ids. Its maps are sorted by name, so those ids must target the
+/// reconstructed order rather than the source `GraphInfo` order.
+fn serialized_operand_ids(
+    graph: &GraphInfo,
+    overrides: Option<&OutputNameOverrides>,
+) -> Result<HashMap<u32, u32>, GraphError> {
+    let mut declarations = graph
+        .operands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, operand)| match operand.kind {
+            OperandKind::Input | OperandKind::Constant => Some((
+                operand_export_name_with_overrides(operand, index, overrides),
+                index as u32,
+                operand.kind,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    declarations.sort_by(|left, right| {
+        let left_group = matches!(left.2, OperandKind::Constant);
+        let right_group = matches!(right.2, OperandKind::Constant);
+        left_group.cmp(&right_group).then(left.0.cmp(&right.0))
+    });
+
+    let mut old_to_new = HashMap::new();
+    let mut name_to_new = HashMap::<String, u32>::new();
+    for (name, old_id, _) in declarations {
+        let new_id =
+            u32::try_from(name_to_new.len()).map_err(|_| GraphError::ConversionFailed {
+                format: "webnn-graph-json".to_string(),
+                reason: "serialized operand count exceeds u32".to_string(),
+            })?;
+        name_to_new.insert(name, new_id);
+        old_to_new.insert(old_id, new_id);
+    }
+
+    for operation in &graph.operations {
+        for &old_id in operation.output_operands_slice() {
+            let operand = graph
+                .operand(old_id)
+                .ok_or_else(|| GraphError::ConversionFailed {
+                    format: "webnn-graph-json".to_string(),
+                    reason: format!(
+                        "operation {} has missing output {old_id}",
+                        operation.op_type()
+                    ),
+                })?;
+            let name = operand_export_name_with_overrides(operand, old_id as usize, overrides);
+            let new_id = if let Some(&existing) = name_to_new.get(&name) {
+                existing
+            } else {
+                let next =
+                    u32::try_from(name_to_new.len()).map_err(|_| GraphError::ConversionFailed {
+                        format: "webnn-graph-json".to_string(),
+                        reason: "serialized operand count exceeds u32".to_string(),
+                    })?;
+                name_to_new.insert(name, next);
+                next
+            };
+            old_to_new.insert(old_id, new_id);
+        }
+    }
+
+    Ok(old_to_new)
 }
 
 /// Controls how constant operands are represented when building the AST.
@@ -281,12 +407,15 @@ pub(crate) fn to_graph_json_with_consts(
         }
     }
 
+    let serialized_operand_ids = serialized_operand_ids(graph, output_override)?;
+
     // Process operations
     for op_idx in 0..graph.operations.len() {
         nodes.push(graph_operation_to_webnn_node_with_overrides(
             graph,
             op_idx,
             output_override,
+            &serialized_operand_ids,
         )?);
     }
 
@@ -656,6 +785,8 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                 .iter()
                 .map(|&id| graph.operands[id as usize].descriptor.data_type)
                 .collect();
+            let central_inference =
+                crate::mlgraphbuilder::shape_inference_single_output(op, graph).ok();
 
             // Infer output shape based on operation type
             let output_shape = match op_type.as_str() {
@@ -1065,7 +1196,12 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
 
                 // For other operations, leave shape empty (will be handled later or is dynamic)
                 _ => None,
-            };
+            }
+            .or_else(|| {
+                central_inference
+                    .as_ref()
+                    .map(|descriptor| descriptor.shape.clone())
+            });
 
             // Update output operand shape if we inferred it
             if let Some(shape) = output_shape
@@ -1190,7 +1326,12 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
                         .cloned()
                         .or_else(|| input_types.get(2).cloned()),
                     _ => None,
-                };
+                }
+                .or_else(|| {
+                    central_inference
+                        .as_ref()
+                        .map(|descriptor| descriptor.data_type)
+                });
                 if let Some(dtype) = output_type {
                     graph.operands[output_id as usize].descriptor.data_type = dtype;
                     // LSTM has multiple outputs (Y_h, Y_c, optional sequence); all match input type.
@@ -1236,6 +1377,9 @@ fn infer_output_shapes(graph: &mut GraphInfo) -> Result<(), GraphError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator_options::{
+        MLBatchNormalizationOptions, MLConv2dOptions, MLDimension, MLOperatorOptions,
+    };
     use webnn_graph::serialize::{SerializeOptions, serialize_graph_to_wg_text};
 
     fn wshape(shape: &[u32]) -> Vec<webnn_graph::ast::Dimension> {
@@ -1244,6 +1388,245 @@ mod tests {
 
     fn ushape(shape: &[u32]) -> Vec<u32> {
         shape.to_vec()
+    }
+
+    #[test]
+    fn operation_parameters_and_operand_options_survive_reordered_text_declarations()
+    -> Result<(), GraphError> {
+        let vector_descriptor = || OperandDescriptor {
+            data_type: DataType::Float32,
+            shape: to_dimension_vector(&[4]),
+            pending_permutation: Vec::new(),
+        };
+        let graph = GraphInfo {
+            operands: vec![
+                Operand {
+                    name: Some("z_input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: vector_descriptor(),
+                },
+                Operand {
+                    name: Some("z_scale".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: vector_descriptor(),
+                },
+                Operand {
+                    name: Some("a_bias".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: vector_descriptor(),
+                },
+                Operand {
+                    name: Some("m_mean".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: vector_descriptor(),
+                },
+                Operand {
+                    name: Some("v_variance".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: vector_descriptor(),
+                },
+                Operand {
+                    name: Some("reshaped".to_string()),
+                    kind: OperandKind::Intermediate,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: to_dimension_vector(&[1, 1, 4]),
+                        pending_permutation: Vec::new(),
+                    },
+                },
+                Operand {
+                    name: Some("output".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: to_dimension_vector(&[1, 1, 4]),
+                        pending_permutation: Vec::new(),
+                    },
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![6],
+            operations: vec![
+                Operation::Reshape {
+                    input: 0,
+                    new_shape: vec![
+                        MLDimension::Static(1),
+                        MLDimension::Static(1),
+                        MLDimension::Static(4),
+                    ],
+                    options: Some(MLOperatorOptions::default()),
+                    outputs: vec![5],
+                },
+                Operation::BatchNormalization {
+                    input: 5,
+                    mean: 3,
+                    variance: 4,
+                    options: Some(MLBatchNormalizationOptions {
+                        scale: Some(1),
+                        bias: Some(2),
+                        axis: 2,
+                        ..MLBatchNormalizationOptions::default()
+                    }),
+                    outputs: vec![6],
+                },
+            ],
+            constant_operand_ids_to_handles: [1u32, 2, 3, 4]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        ConstantData {
+                            data: vec![0; 4 * std::mem::size_of::<f32>()],
+                            label: None,
+                        },
+                    )
+                })
+                .collect(),
+            ..GraphInfo::default()
+        };
+
+        let ast = to_graph_json(&graph, false)?;
+        let text = serialize_graph_to_wg_text(&ast, SerializeOptions { quantized: false })
+            .map_err(|error| GraphError::ConversionFailed {
+                format: "webnn-graph-text".to_string(),
+                reason: error.to_string(),
+            })?;
+        let parsed = webnn_graph::parser::parse_wg_text(&text).map_err(|error| {
+            GraphError::ConversionFailed {
+                format: "webnn-graph-text".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        let loaded = from_graph_json(&parsed)?;
+
+        let reshape_shape = loaded
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                Operation::Reshape { new_shape, .. } => Some(new_shape),
+                _ => None,
+            });
+        assert_eq!(
+            reshape_shape,
+            Some(&vec![
+                MLDimension::Static(1),
+                MLDimension::Static(1),
+                MLDimension::Static(4),
+            ])
+        );
+
+        let normalization = loaded
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                Operation::BatchNormalization {
+                    options: Some(options),
+                    ..
+                } => Some(options),
+                _ => None,
+            });
+        let Some(normalization) = normalization else {
+            return Err(GraphError::ConversionFailed {
+                format: "webnn-graph-text".to_string(),
+                reason: "round-tripped batch normalization is missing".to_string(),
+            });
+        };
+        let operand_name = |id: Option<u32>| {
+            id.and_then(|id| loaded.operands.get(id as usize))
+                .and_then(|operand| operand.name.as_deref())
+        };
+        assert_eq!(operand_name(normalization.scale), Some("z_scale"));
+        assert_eq!(operand_name(normalization.bias), Some("a_bias"));
+        Ok(())
+    }
+
+    #[test]
+    fn convolution_shape_survives_text_roundtrip() -> Result<(), GraphError> {
+        let descriptor = |shape: &[u32]| OperandDescriptor {
+            data_type: DataType::Float32,
+            shape: to_dimension_vector(shape),
+            pending_permutation: Vec::new(),
+        };
+        let graph = GraphInfo {
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: descriptor(&[1, 1, 128, 1500]),
+                },
+                Operand {
+                    name: Some("filter".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: descriptor(&[32, 1, 4, 3]),
+                },
+                Operand {
+                    name: Some("bias".to_string()),
+                    kind: OperandKind::Constant,
+                    descriptor: descriptor(&[32]),
+                },
+                Operand {
+                    name: Some("output".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: descriptor(&[1, 32, 32, 1500]),
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![3],
+            operations: vec![Operation::Conv2d {
+                input: 0,
+                filter: 1,
+                options: Some(MLConv2dOptions {
+                    bias: Some(2),
+                    padding: vec![0, 0, 1, 1],
+                    strides: vec![4, 1],
+                    ..MLConv2dOptions::default()
+                }),
+                outputs: vec![3],
+            }],
+            constant_operand_ids_to_handles: HashMap::from([
+                (
+                    1,
+                    ConstantData {
+                        data: vec![0; 32 * 4 * 3 * std::mem::size_of::<f32>()],
+                        label: None,
+                    },
+                ),
+                (
+                    2,
+                    ConstantData {
+                        data: vec![0; 32 * std::mem::size_of::<f32>()],
+                        label: None,
+                    },
+                ),
+            ]),
+            ..GraphInfo::default()
+        };
+
+        let text = serialize_graph_to_wg_text(
+            &to_graph_json(&graph, false)?,
+            SerializeOptions { quantized: false },
+        )
+        .map_err(|error| GraphError::ConversionFailed {
+            format: "webnn-graph-text".to_string(),
+            reason: error.to_string(),
+        })?;
+        let parsed = webnn_graph::parser::parse_wg_text(&text).map_err(|error| {
+            GraphError::ConversionFailed {
+                format: "webnn-graph-text".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        let loaded = from_graph_json(&parsed)?;
+        let output = loaded
+            .operands
+            .iter()
+            .find(|operand| operand.name.as_deref() == Some("output"));
+
+        assert_eq!(
+            output.map(|operand| &operand.descriptor.shape),
+            Some(&to_dimension_vector(&[1, 32, 32, 1500]))
+        );
+        Ok(())
     }
 
     #[test]
