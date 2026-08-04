@@ -49,6 +49,10 @@ struct Cli {
     #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
     #[arg(long, requires = "run_coreml")]
     coreml_compiled_output: Option<PathBuf>,
+    /// Number of predictions to run per CoreML compute-unit configuration.
+    #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
+    #[arg(long, requires = "run_coreml", default_value_t = 1)]
+    coreml_runs: usize,
     /// Execute the converted ONNX graph with zeroed inputs (requires `onnx-runtime` feature).
     #[cfg(feature = "onnx-runtime")]
     #[arg(long, requires = "convert")]
@@ -165,10 +169,11 @@ fn run() -> Result<(), GraphError> {
                     format: converted.format.to_string(),
                 });
             }
-            let attempts = rustnn::run_coreml_zeroed_cached(
+            let attempts = rustnn::coreml::run_coreml_zeroed_cached_with_runs(
                 &converted.data,
                 &artifacts.input_names_to_descriptors,
                 cli.coreml_compiled_output.as_deref(),
+                cli.coreml_runs,
             )?;
             println!("Executed CoreML model with zeroed inputs:");
             for attempt in attempts {
@@ -176,9 +181,20 @@ fn run() -> Result<(), GraphError> {
                     Ok(outputs) => {
                         println!("  - {} succeeded:", attempt.compute_unit);
                         for out in outputs {
+                            let minimum = out.data.iter().copied().fold(f32::INFINITY, f32::min);
+                            let maximum =
+                                out.data.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                            let sum: f64 = out.data.iter().map(|value| f64::from(*value)).sum();
+                            let preview = out
+                                .data
+                                .iter()
+                                .take(4)
+                                .map(|value| format!("{value:.9}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
                             println!(
-                                "      {}: shape={:?} type_code={}",
-                                out.name, out.shape, out.data_type_code
+                                "      {}: shape={:?} type_code={} min={minimum:.9} max={maximum:.9} sum={sum:.9} first=[{preview}]",
+                                out.name, out.shape, out.data_type_code,
                             );
                         }
                     }
@@ -303,6 +319,7 @@ fn run() -> Result<(), GraphError> {
 }
 
 fn main() {
+    let _ = pretty_env_logger::try_init();
     #[cfg(any(
         feature = "onnx-runtime",
         feature = "trtx-runtime-mock",

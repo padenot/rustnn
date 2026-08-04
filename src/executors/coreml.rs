@@ -11,8 +11,10 @@ use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
+use std::time::Instant;
 
 use block::ConcreteBlock;
+use log::debug;
 use objc::rc::autoreleasepool;
 use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
@@ -83,6 +85,30 @@ pub struct CoremlRunAttempt {
     pub result: Result<Vec<CoremlOutput>, String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i64)]
+enum CoremlComputeUnits {
+    CpuOnly = 0,
+    CpuAndGpu = 1,
+    All = 2,
+    CpuAndNeuralEngine = 3,
+}
+
+impl CoremlComputeUnits {
+    fn raw_value(self) -> i64 {
+        self as i64
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CpuOnly => "CPU_ONLY",
+            Self::CpuAndGpu => "CPU_AND_GPU",
+            Self::All => "ALL",
+            Self::CpuAndNeuralEngine => "CPU_AND_NE",
+        }
+    }
+}
+
 pub fn run_coreml_zeroed(
     model_bytes: &[u8],
     inputs: &HashMap<String, OperandDescriptor>,
@@ -98,6 +124,25 @@ pub fn run_coreml_zeroed_cached(
     run_coreml_zeroed_cached_with_weights(model_bytes, None, inputs, compiled_path)
 }
 
+/// Run repeated zero-input CoreML predictions while reusing each loaded model.
+pub fn run_coreml_zeroed_cached_with_runs(
+    model_bytes: &[u8],
+    inputs: &HashMap<String, OperandDescriptor>,
+    compiled_path: Option<&Path>,
+    repetitions: usize,
+) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+    autoreleasepool(|| {
+        run_impl_zeroed_with_weights(
+            model_bytes,
+            None,
+            inputs,
+            compiled_path,
+            repetitions,
+            &benchmark_compute_units(),
+        )
+    })
+}
+
 /// Run CoreML inference with zeroed inputs and optional weight file
 pub fn run_coreml_zeroed_cached_with_weights(
     model_bytes: &[u8],
@@ -106,7 +151,14 @@ pub fn run_coreml_zeroed_cached_with_weights(
     compiled_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     autoreleasepool(|| {
-        run_impl_zeroed_with_weights(model_bytes, weights_data, inputs, compiled_path)
+        run_impl_zeroed_with_weights(
+            model_bytes,
+            weights_data,
+            inputs,
+            compiled_path,
+            1,
+            &preferred_compute_units(),
+        )
     })
 }
 
@@ -199,6 +251,12 @@ impl RetainedObjcObject {
     fn as_ptr(&self) -> *mut Object {
         self.0
     }
+
+    fn into_raw(mut self) -> *mut Object {
+        let object = self.0;
+        self.0 = ptr::null_mut();
+        object
+    }
 }
 
 impl Drop for RetainedObjcObject {
@@ -271,17 +329,30 @@ pub(crate) struct CoremlByteInput<'a> {
     pub(crate) descriptor: &'a OperandDescriptor,
 }
 
-/// Map a [`DeviceType`] to an `MLComputeUnits` raw value.
+/// Map a [`DeviceType`] to a strongly typed Core ML compute-unit policy.
 ///
 /// Apple's `MLComputeUnits`: `cpuOnly = 0`, `cpuAndGPU = 1`, `all = 2`, `cpuAndNeuralEngine = 3`.
 fn compute_unit_for_device(
     device_type: crate::backend_selection::DeviceType,
-) -> (i64, &'static str) {
+) -> CoremlComputeUnits {
     match device_type {
-        crate::backend_selection::DeviceType::Npu => (3, "CPU_AND_NE"),
-        crate::backend_selection::DeviceType::Gpu => (1, "CPU_AND_GPU"),
-        crate::backend_selection::DeviceType::Cpu => (0, "CPU_ONLY"),
+        crate::backend_selection::DeviceType::Npu => CoremlComputeUnits::CpuAndNeuralEngine,
+        crate::backend_selection::DeviceType::Gpu => CoremlComputeUnits::CpuAndGpu,
+        crate::backend_selection::DeviceType::Cpu => CoremlComputeUnits::CpuOnly,
     }
+}
+
+fn preferred_compute_units() -> [CoremlComputeUnits; 2] {
+    [CoremlComputeUnits::All, CoremlComputeUnits::CpuOnly]
+}
+
+fn benchmark_compute_units() -> [CoremlComputeUnits; 4] {
+    [
+        CoremlComputeUnits::CpuOnly,
+        CoremlComputeUnits::CpuAndGpu,
+        CoremlComputeUnits::All,
+        CoremlComputeUnits::CpuAndNeuralEngine,
+    ]
 }
 
 /// Load a CoreML model directly from protobuf bytes and retain it for repeated
@@ -299,21 +370,21 @@ pub(crate) fn compile_model(
         let (asset, specification_data, retained_weights_data) =
             create_in_memory_model_asset(model_bytes, weights_data)?;
 
-        let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
-        let mut candidates: Vec<(i64, &'static str)> = vec![(preferred_code, preferred_name)];
-        if preferred_code != 0 {
-            candidates.push((0, "CPU_ONLY"));
+        let preferred = compute_unit_for_device(device_type);
+        let mut candidates = vec![preferred];
+        if preferred != CoremlComputeUnits::CpuOnly {
+            candidates.push(CoremlComputeUnits::CpuOnly);
         }
 
         let mut last_error = String::from("MLModel load failed");
-        for (code, name) in candidates {
+        for compute_units in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
-            let () = msg_send![config, setComputeUnits: code];
+            let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
             match load_model_asset(asset, config) {
                 Ok(model) => {
                     return Ok(CompiledCoremlModel {
                         model,
-                        compute_unit: name,
+                        compute_unit: compute_units.label(),
                         backing: CoremlModelBacking::InMemory {
                             asset,
                             specification_data,
@@ -351,20 +422,21 @@ fn compile_model_from_url(
     autoreleasepool(|| unsafe {
         let (compiled_url, compiled_dir, temp_model) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
-        let (preferred_code, preferred_name) = compute_unit_for_device(device_type);
-        let mut candidates = vec![(preferred_code, preferred_name)];
-        if preferred_code != 0 {
-            candidates.push((0, "CPU_ONLY"));
+        let compiled_url = RetainedObjcObject::new(compiled_url);
+        let preferred = compute_unit_for_device(device_type);
+        let mut candidates = vec![preferred];
+        if preferred != CoremlComputeUnits::CpuOnly {
+            candidates.push(CoremlComputeUnits::CpuOnly);
         }
 
         let mut last_error = String::from("MLModel load failed");
-        for (code, name) in candidates {
+        for compute_units in candidates {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
-            let () = msg_send![config, setComputeUnits: code];
+            let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_load(
-                compiled_url,
+                compiled_url.as_ptr(),
                 config,
                 &mut model,
                 error.as_mut_ptr().cast(),
@@ -374,11 +446,9 @@ fn compile_model_from_url(
                 last_error = format!("MLModel load failed: {}", shim_error_to_string(&error));
                 continue;
             }
-            // The shim returns a borrowed model. Retain it beyond this pool.
-            let _: *mut Object = msg_send![model, retain];
             return Ok(CompiledCoremlModel {
                 model,
-                compute_unit: name,
+                compute_unit: compute_units.label(),
                 backing: CoremlModelBacking::OnDisk {
                     compiled_dir,
                     temp_model,
@@ -1028,7 +1098,14 @@ fn run_impl_zeroed(
     inputs: &HashMap<String, OperandDescriptor>,
     compiled_path: Option<&Path>,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
-    run_impl_zeroed_with_weights(model_bytes, None, inputs, compiled_path)
+    run_impl_zeroed_with_weights(
+        model_bytes,
+        None,
+        inputs,
+        compiled_path,
+        1,
+        &preferred_compute_units(),
+    )
 }
 
 fn run_impl_zeroed_with_weights(
@@ -1036,26 +1113,29 @@ fn run_impl_zeroed_with_weights(
     weights_data: Option<&[u8]>,
     inputs: &HashMap<String, OperandDescriptor>,
     compiled_path: Option<&Path>,
+    repetitions: usize,
+    targets: &[CoremlComputeUnits],
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+    if repetitions == 0 {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: "CoreML prediction repetition count must be positive".to_string(),
+        });
+    }
     unsafe {
         let (compiled_url, compiled_path_buf, temp_mlmodel) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, compiled_path)?;
+        let compiled_url = RetainedObjcObject::new(compiled_url);
 
-        // Try only Neural Engine + GPU (best performance on Apple Silicon)
-        // Fallback to ALL if that fails
-        let targets = [
-            (3i64, "CPU_AND_NE"), // Neural Engine + GPU (best for Apple Silicon)
-            (0i64, "ALL"),        // Fallback to all available compute units
-        ];
         let mut attempts = Vec::new();
 
-        for (code, name) in targets {
+        for &compute_units in targets {
+            let name = compute_units.label();
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
-            let () = msg_send![config, setComputeUnits: code];
+            let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_load(
-                compiled_url,
+                compiled_url.as_ptr(),
                 config,
                 &mut model,
                 error.as_mut_ptr().cast(),
@@ -1071,7 +1151,8 @@ fn run_impl_zeroed_with_weights(
                 });
                 continue;
             }
-            let model_description: *mut Object = msg_send![model, modelDescription];
+            let model = RetainedObjcObject::new(model);
+            let model_description: *mut Object = msg_send![model.as_ptr(), modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
@@ -1139,26 +1220,49 @@ fn run_impl_zeroed_with_weights(
             }
             let provider = RetainedObjcObject::new(provider);
 
-            let mut output_provider: *mut Object = ptr::null_mut();
-            let mut error = [0u8; 1024];
-            let status = rustnn_coreml_predict(
-                model,
-                provider.as_ptr(),
-                &mut output_provider,
-                error.as_mut_ptr().cast(),
-                error.len(),
-            );
-            if status != 0 || output_provider.is_null() {
-                attempts.push(CoremlRunAttempt {
-                    compute_unit: name,
-                    result: Err(format!(
+            let mut final_output_provider = None;
+            let mut prediction_error = None;
+            for repetition in 0..repetitions {
+                let mut output_provider: *mut Object = ptr::null_mut();
+                let mut error = [0u8; 1024];
+                let started = Instant::now();
+                let status = rustnn_coreml_predict(
+                    model.as_ptr(),
+                    provider.as_ptr(),
+                    &mut output_provider,
+                    error.as_mut_ptr().cast(),
+                    error.len(),
+                );
+                let elapsed = started.elapsed();
+                debug!(
+                    target: "rustnn::executors::coreml",
+                    "CoreML {name} prediction {}/{} took {elapsed:?}",
+                    repetition + 1,
+                    repetitions
+                );
+                if status != 0 || output_provider.is_null() {
+                    prediction_error = Some(format!(
                         "prediction failed: {}",
                         shim_error_to_string(&error)
-                    )),
+                    ));
+                    break;
+                }
+                final_output_provider = Some(RetainedObjcObject::new(output_provider));
+            }
+            if let Some(reason) = prediction_error {
+                attempts.push(CoremlRunAttempt {
+                    compute_unit: name,
+                    result: Err(reason),
                 });
                 continue;
             }
-            let output_provider = RetainedObjcObject::new(output_provider);
+            let Some(output_provider) = final_output_provider else {
+                attempts.push(CoremlRunAttempt {
+                    compute_unit: name,
+                    result: Err("CoreML prediction produced no output provider".to_string()),
+                });
+                continue;
+            };
 
             match collect_outputs(output_provider.as_ptr()) {
                 Ok(outputs) => attempts.push(CoremlRunAttempt {
@@ -1215,22 +1319,19 @@ fn run_impl_with_inputs_with_weights(
     unsafe {
         let (compiled_url, compiled_path_buf, temp_mlmodel) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, cache_path)?;
+        let compiled_url = RetainedObjcObject::new(compiled_url);
 
-        // Try only Neural Engine + GPU (best performance on Apple Silicon)
-        // Fallback to ALL if that fails
-        let targets = [
-            (3i64, "CPU_AND_NE"), // Neural Engine + GPU (best for Apple Silicon)
-            (0i64, "ALL"),        // Fallback to all available compute units
-        ];
+        let targets = preferred_compute_units();
         let mut attempts = Vec::new();
 
-        for (code, name) in targets {
+        for compute_units in targets {
+            let name = compute_units.label();
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
-            let () = msg_send![config, setComputeUnits: code];
+            let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
             let mut model: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_load(
-                compiled_url,
+                compiled_url.as_ptr(),
                 config,
                 &mut model,
                 error.as_mut_ptr().cast(),
@@ -1246,9 +1347,10 @@ fn run_impl_with_inputs_with_weights(
                 });
                 continue;
             }
+            let model = RetainedObjcObject::new(model);
 
             // Get model input descriptions to query expected data types
-            let model_description: *mut Object = msg_send![model, modelDescription];
+            let model_description: *mut Object = msg_send![model.as_ptr(), modelDescription];
             let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
 
             let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
@@ -1325,7 +1427,7 @@ fn run_impl_with_inputs_with_weights(
             let mut output_provider: *mut Object = ptr::null_mut();
             let mut error = [0u8; 1024];
             let status = rustnn_coreml_predict(
-                model,
+                model.as_ptr(),
                 provider.as_ptr(),
                 &mut output_provider,
                 error.as_mut_ptr().cast(),
@@ -1519,6 +1621,12 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
     weights_data: Option<&[u8]>,
     cached_compiled: Option<&Path>,
 ) -> Result<(*mut Object, PathBuf, Option<TempModelSource>), GraphError> {
+    if let Some(path) = cached_compiled.filter(|path| path.is_dir()) {
+        let cached_url = unsafe { nsurl_from_path(path)? };
+        let retained_url: *mut Object = msg_send![cached_url, retain];
+        return Ok((retained_url, path.to_path_buf(), None));
+    }
+
     let temp_mlmodel = write_temp_model_with_weights(model_bytes, weights_data)?;
     let url = unsafe { nsurl_from_path(temp_mlmodel.path())? };
     let mut compiled_url: *mut Object = ptr::null_mut();
@@ -1537,7 +1645,8 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
         });
     }
 
-    let compiled_path_obj: *mut Object = msg_send![compiled_url, path];
+    let compiled_url = RetainedObjcObject::new(compiled_url);
+    let compiled_path_obj: *mut Object = msg_send![compiled_url.as_ptr(), path];
     let compiled_src_path = PathBuf::from(unsafe { nsstring_to_string(compiled_path_obj) });
 
     if let Some(path) = cached_compiled {
@@ -1550,10 +1659,15 @@ pub(crate) unsafe fn prepare_compiled_model_with_weights(
             });
         }
         let persisted_url = unsafe { nsurl_from_path(path)? };
-        return Ok((persisted_url, path.to_path_buf(), Some(temp_mlmodel)));
+        let retained_url: *mut Object = msg_send![persisted_url, retain];
+        return Ok((retained_url, path.to_path_buf(), Some(temp_mlmodel)));
     }
 
-    Ok((compiled_url, compiled_src_path, Some(temp_mlmodel)))
+    Ok((
+        compiled_url.into_raw(),
+        compiled_src_path,
+        Some(temp_mlmodel),
+    ))
 }
 
 #[allow(dead_code)]
@@ -1989,7 +2103,31 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod temp_model_tests {
-    use super::{CompiledCoremlModel, TempModelSource, write_temp_model_with_weights};
+    use super::{
+        CompiledCoremlModel, CoremlComputeUnits, TempModelSource, benchmark_compute_units,
+        preferred_compute_units, write_temp_model_with_weights,
+    };
+
+    #[test]
+    fn compute_unit_values_match_coreml_framework() {
+        assert_eq!(CoremlComputeUnits::CpuOnly.raw_value(), 0);
+        assert_eq!(CoremlComputeUnits::CpuAndGpu.raw_value(), 1);
+        assert_eq!(CoremlComputeUnits::All.raw_value(), 2);
+        assert_eq!(CoremlComputeUnits::CpuAndNeuralEngine.raw_value(), 3);
+        assert_eq!(
+            benchmark_compute_units(),
+            [
+                CoremlComputeUnits::CpuOnly,
+                CoremlComputeUnits::CpuAndGpu,
+                CoremlComputeUnits::All,
+                CoremlComputeUnits::CpuAndNeuralEngine,
+            ]
+        );
+        assert_eq!(
+            preferred_compute_units(),
+            [CoremlComputeUnits::All, CoremlComputeUnits::CpuOnly]
+        );
+    }
 
     #[test]
     fn compiled_model_can_move_between_serialized_callers() {

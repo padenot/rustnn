@@ -36,7 +36,8 @@ static void rustnn_copy_err(char *buf, size_t len, NSString *msg) {
 }
 
 // Compile a `.mlmodel`/`.mlpackage` at `model_url`. On success `*out_url` is a
-// borrowed (autoreleased) NSURL valid for the caller's current autorelease pool.
+// retained NSURL owned by the caller. Returning explicit ownership across the C
+// boundary avoids relying on an autorelease pool created in another language.
 int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err_len) {
     *out_url = NULL;
     @try {
@@ -47,7 +48,7 @@ int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err
                             nserr ? [nserr localizedDescription] : @"MLModel compile failed");
             return 1;
         }
-        *out_url = (__bridge void *)compiled;
+        *out_url = (__bridge_retained void *)compiled;
         return 0;
     } @catch (NSException *e) {
         rustnn_copy_err(err, err_len,
@@ -60,9 +61,7 @@ int rustnn_coreml_compile(void *model_url, void **out_url, char *err, size_t err
 }
 
 // Load an MLModel from a compiled URL with the given configuration. On success
-// `*out_model` is a borrowed (autoreleased) MLModel valid for the caller's
-// current autorelease pool; callers that need it to outlive the pool must
-// `retain` it themselves (as compile_model does).
+// `*out_model` is a retained MLModel owned by the caller.
 int rustnn_coreml_load(void *compiled_url, void *config, void **out_model, char *err,
                        size_t err_len) {
     *out_model = NULL;
@@ -76,7 +75,7 @@ int rustnn_coreml_load(void *compiled_url, void *config, void **out_model, char 
                             nserr ? [nserr localizedDescription] : @"MLModel load failed");
             return 1;
         }
-        *out_model = (__bridge void *)model;
+        *out_model = (__bridge_retained void *)model;
         return 0;
     } @catch (NSException *e) {
         rustnn_copy_err(err, err_len,
