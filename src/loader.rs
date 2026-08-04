@@ -87,9 +87,10 @@ fn map_weight_resolve_error(err: WeightResolveError) -> GraphError {
 
 /// Load a graph from a webnn-graph file (.webnn text or .json)
 ///
-/// Supports two formats:
+/// Supports three formats:
 /// - `.webnn` - Text DSL format (parsed and converted to JSON)
 /// - `.json` - Direct JSON format (webnn-graph-json)
+/// - `.json` - RustNN's native serialized [`GraphInfo`]
 ///
 /// When the graph contains `@weights` / `ConstInit::Weights` references, external tensors are
 /// resolved by [`webnn_graph::external_weights::resolve_external_weights`] (strict I/O
@@ -113,8 +114,11 @@ pub fn load_graph_from_path(path: impl AsRef<Path>) -> Result<GraphInfo, GraphEr
                 })?
             }
             Some("json") => {
-                // Parse JSON format
-                serde_json::from_str(&contents)?
+                let json: serde_json::Value = serde_json::from_str(&contents)?;
+                if json.get("format").is_none() && json.get("operands").is_some() {
+                    return Ok(serde_json::from_value(json)?);
+                }
+                serde_json::from_value(json)?
             }
             _ => {
                 return Err(GraphError::ConversionFailed {
@@ -843,5 +847,19 @@ mod tests {
         // Should match namespace separator (:: -> __)
         let result = load_graph_from_path(&graph_path);
         result.unwrap();
+    }
+
+    #[test]
+    fn test_load_native_graph_info_json() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = TempDir::new()?;
+        let json_path = temp_dir.path().join("native-graph.json");
+        let graph = GraphInfo::default();
+        fs::write(&json_path, serde_json::to_vec(&graph)?)?;
+
+        let loaded = load_graph_from_path(&json_path)?;
+
+        assert!(loaded.operands.is_empty());
+        assert!(loaded.operations.is_empty());
+        Ok(())
     }
 }
