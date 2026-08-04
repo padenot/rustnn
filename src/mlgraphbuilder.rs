@@ -2245,9 +2245,23 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         name: &str,
         descriptor: &MLOperandDescriptor,
     ) -> crate::error::Result<MLOperand> {
+        self.rustnn_input(name, descriptor.into())
+    }
+
+    /// Add an input from RustNN's graph descriptor, preserving dynamic dimensions.
+    ///
+    /// The WebNN-facing [`MLOperandDescriptor`] currently carries only concrete
+    /// dimensions. Importers that build a backend-independent [`GraphInfo`] can
+    /// use this RustNN extension when the source model declares bounded dynamic
+    /// dimensions.
+    pub fn rustnn_input(
+        &mut self,
+        name: &str,
+        descriptor: OperandDescriptor,
+    ) -> crate::error::Result<MLOperand> {
         debug!("Adding input {name:?} {descriptor:?}");
         let operand = Operand {
-            descriptor: descriptor.into(),
+            descriptor,
             kind: OperandKind::Input,
             name: Some(name.to_string()),
         };
@@ -3173,6 +3187,35 @@ mod test {
             graph.operands.get(1).map(|operand| operand.kind),
             Some(crate::OperandKind::Output)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn graph_descriptor_input_preserves_dynamic_dimensions() -> crate::error::Result<()> {
+        let descriptor = crate::OperandDescriptor {
+            data_type: crate::DataType::Float32,
+            shape: vec![
+                crate::graph::Dimension::Dynamic(crate::graph::DynamicDimension {
+                    name: "batch_size".to_string(),
+                    max_size: 8,
+                }),
+                crate::graph::Dimension::Static(128),
+            ],
+            pending_permutation: Vec::new(),
+        };
+        let mut builder = MLGraphBuilder::new_for_graph_info();
+        let input = builder.rustnn_input("spectrogram", descriptor)?;
+        let output = builder.identity(input)?;
+        let outputs = HashMap::from([("output", output)]);
+
+        let graph = builder.finish_graph_info(&outputs)?;
+
+        assert!(graph.has_dynamic_dimensions());
+        assert!(matches!(
+            graph.operands[0].descriptor.shape.first(),
+            Some(crate::graph::Dimension::Dynamic(dynamic))
+                if dynamic.name == "batch_size" && dynamic.max_size == 8
+        ));
         Ok(())
     }
 
