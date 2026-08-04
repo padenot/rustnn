@@ -538,21 +538,42 @@ impl CoremlMlProgramConverter {
         // Create tensor value from constant data
         let tensor_value = match operand.descriptor.data_type {
             crate::graph::DataType::Float32 => {
-                // Convert raw bytes to f32 values
-                let float_count = constant_data.data.len() / 4;
-                let mut floats = Vec::with_capacity(float_count);
-                for i in 0..float_count {
-                    let bytes = [
-                        constant_data.data[i * 4],
-                        constant_data.data[i * 4 + 1],
-                        constant_data.data[i * 4 + 2],
-                        constant_data.data[i * 4 + 3],
-                    ];
-                    floats.push(f32::from_le_bytes(bytes));
+                if !operand.descriptor.shape.is_empty() {
+                    let offset = weight_builder.add_weight(
+                        operand_id,
+                        super::weight_file_builder::blob_data_type::FLOAT32,
+                        &constant_data.data,
+                    )?;
+                    let blob_file_value = Value {
+                        doc_string: String::new(),
+                        r#type: output_type.r#type.clone(),
+                        value: Some(value::Value::BlobFileValue(value::BlobFileValue {
+                            file_name: "@model_path/weights/weights.bin".to_string(),
+                            offset,
+                        })),
+                    };
+                    let mut attributes = HashMap::new();
+                    attributes.insert("val".to_string(), blob_file_value);
+                    return Ok(MilOperation {
+                        r#type: "const".to_string(),
+                        inputs: HashMap::new(),
+                        outputs: vec![output_type],
+                        attributes,
+                        ..Default::default()
+                    });
                 }
+
+                let bytes =
+                    constant_data
+                        .data
+                        .get(..4)
+                        .ok_or_else(|| GraphError::ConversionFailed {
+                            format: "coreml_mlprogram".to_string(),
+                            reason: format!("Float32 scalar operand {operand_id} has no value"),
+                        })?;
                 TensorValue {
                     value: Some(tensor_value::Value::Floats(tensor_value::RepeatedFloats {
-                        values: floats,
+                        values: vec![f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])],
                     })),
                 }
             }
@@ -9390,8 +9411,8 @@ mod tests {
     }
 
     #[test]
-    fn test_float32_constant_no_weight_file() {
-        // Create a graph with Float32 constant (should NOT use weight file)
+    fn test_float32_tensor_constant_uses_weight_file() {
+        // Create a graph with a non-scalar Float32 constant.
         let mut graph = GraphInfo {
             input_operands: vec![],
             output_operands: vec![1],
@@ -9441,11 +9462,13 @@ mod tests {
         let converter = CoremlMlProgramConverter;
         let result = converter.convert(&graph).unwrap();
 
-        // Verify NO weights_data (Float32 uses immediate values)
-        assert!(
-            result.weights_data.is_none(),
-            "Float32 constants should not use weight file"
-        );
+        let weights = result
+            .weights_data
+            .expect("non-scalar Float32 constants should use the external weight file");
+        assert_eq!(&weights[0..4], &1u32.to_le_bytes());
+        assert_eq!(&weights[68..72], &2u32.to_le_bytes());
+        assert_eq!(&weights[72..80], &4u64.to_le_bytes());
+        assert_eq!(&weights[128..132], &[0x00, 0x00, 0x80, 0x3F]);
     }
 
     #[test]

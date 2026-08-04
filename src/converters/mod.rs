@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::error::GraphError;
 use crate::graph::GraphInfo;
@@ -57,6 +58,99 @@ pub struct ConvertedGraph {
     pub data: Vec<u8>,
     /// Optional weight file data for formats that require external weights (e.g., CoreML Float16)
     pub weights_data: Option<Vec<u8>>,
+}
+
+/// Write a converted Core ML graph as a deterministic `.mlpackage` source artifact.
+///
+/// This does not invoke Core ML compilation. Build tooling can pass the resulting package to
+/// `coremlcompiler compile` ahead of time and ship the generated `.mlmodelc` directory.
+pub fn save_coreml_package(
+    converted: &ConvertedGraph,
+    package_path: &Path,
+) -> Result<(), GraphError> {
+    if converted.format != "coreml" {
+        return Err(GraphError::ConversionFailed {
+            format: converted.format.to_owned(),
+            reason: "only Core ML conversions can be written as .mlpackage".to_owned(),
+        });
+    }
+    if package_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("mlpackage")
+    {
+        return Err(GraphError::ConversionFailed {
+            format: "coreml".to_owned(),
+            reason: format!(
+                "Core ML package path must end in .mlpackage: {}",
+                package_path.display()
+            ),
+        });
+    }
+    if package_path.exists() {
+        let mut entries = std::fs::read_dir(package_path)
+            .map_err(|error| GraphError::export(package_path, error))?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(|error| GraphError::export(package_path, error))?
+            .is_some()
+        {
+            return Err(GraphError::ConversionFailed {
+                format: "coreml".to_owned(),
+                reason: format!(
+                    "refusing to overwrite non-empty Core ML package {}",
+                    package_path.display()
+                ),
+            });
+        }
+    }
+
+    let data_dir = package_path.join("Data").join("com.apple.CoreML");
+    std::fs::create_dir_all(&data_dir).map_err(|error| GraphError::export(&data_dir, error))?;
+    let model_path = data_dir.join("model.mlmodel");
+    std::fs::write(&model_path, &converted.data)
+        .map_err(|error| GraphError::export(&model_path, error))?;
+
+    let model_id = "00000000-0000-0000-0000-0000000000AA";
+    let weights_id = "00000000-0000-0000-0000-0000000000BB";
+    let weights_entry = if let Some(weights) = &converted.weights_data {
+        let weights_dir = data_dir.join("weights");
+        std::fs::create_dir_all(&weights_dir)
+            .map_err(|error| GraphError::export(&weights_dir, error))?;
+        let weights_path = weights_dir.join("weights.bin");
+        std::fs::write(&weights_path, weights)
+            .map_err(|error| GraphError::export(&weights_path, error))?;
+        format!(
+            r#",
+    "{weights_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Weights",
+      "name": "weights",
+      "path": "com.apple.CoreML/weights"
+    }}"#
+        )
+    } else {
+        String::new()
+    };
+    let manifest = format!(
+        r#"{{
+  "fileFormatVersion": "1.0.0",
+  "itemInfoEntries": {{
+    "{model_id}": {{
+      "author": "com.apple.CoreML",
+      "description": "CoreML Model Specification",
+      "name": "model.mlmodel",
+      "path": "com.apple.CoreML/model.mlmodel"
+    }}{weights_entry}
+  }},
+  "rootModelIdentifier": "{model_id}"
+}}
+"#
+    );
+    let manifest_path = package_path.join("Manifest.json");
+    std::fs::write(&manifest_path, manifest)
+        .map_err(|error| GraphError::export(&manifest_path, error))
 }
 
 pub trait GraphConverter {

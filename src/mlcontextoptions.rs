@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2
 
 use crate::mlcontext::{Backend, BackendDevice};
+use std::path::PathBuf;
 
 #[derive(Debug, Default, PartialEq, Eq, Copy, Clone)]
 pub enum MLPowerPreference {
@@ -131,13 +132,12 @@ impl Default for OrtOptions {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Debug)]
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
 #[non_exhaustive]
-pub struct CoremlOptions {}
-
-#[allow(clippy::derivable_impls)]
-impl Default for CoremlOptions {
-    fn default() -> Self {
-        Self {}
-    }
+pub struct CoremlOptions {
+    /// Ahead-of-time compiled `.mlmodelc` artifact to load for the graph.
+    ///
+    /// When set, RustNN validates and retains the supplied [`crate::GraphInfo`] for tensor
+    /// descriptors but does not convert or compile the graph at runtime.
+    pub compiled_model_path: Option<PathBuf>,
 }

@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use block::ConcreteBlock;
-use log::debug;
+use log::{debug, info};
 use objc::rc::autoreleasepool;
 use objc::runtime::{Class, Object};
 use objc::{class, msg_send, sel, sel_impl};
@@ -51,6 +51,14 @@ unsafe extern "C" {
         model: *mut Object,
         features: *mut Object,
         out_provider: *mut *mut Object,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+    fn rustnn_coreml_predict_batch(
+        model: *mut Object,
+        features: *const *mut Object,
+        feature_count: usize,
+        out_batch: *mut *mut Object,
         error: *mut c_char,
         error_length: usize,
     ) -> i32;
@@ -285,12 +293,21 @@ enum CoremlModelBacking {
         #[allow(dead_code)]
         temp_model: Option<TempModelSource>,
     },
+    /// The application owns this ahead-of-time compiled artifact.
+    Precompiled { path: PathBuf },
 }
 
 impl std::fmt::Debug for CompiledCoremlModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CompiledCoremlModel")
             .field("compute_unit", &self.compute_unit)
+            .field(
+                "precompiled_path",
+                &match &self.backing {
+                    CoremlModelBacking::Precompiled { path } => Some(path),
+                    _ => None,
+                },
+            )
             .finish()
     }
 }
@@ -319,6 +336,7 @@ impl Drop for CompiledCoremlModel {
                 // so remove it explicitly. `temp_model`, if any, cleans itself up on drop.
                 let _ = std::fs::remove_dir_all(compiled_dir);
             }
+            CoremlModelBacking::Precompiled { .. } => {}
         }
     }
 }
@@ -354,6 +372,65 @@ fn benchmark_compute_units() -> [CoremlComputeUnits; 4] {
         CoremlComputeUnits::All,
         CoremlComputeUnits::CpuAndNeuralEngine,
     ]
+}
+
+/// Load an ahead-of-time compiled `.mlmodelc` artifact without conversion or compilation.
+pub(crate) fn load_compiled_model(path: &Path) -> Result<CompiledCoremlModel, GraphError> {
+    let canonical =
+        std::fs::canonicalize(path).map_err(|error| GraphError::CoremlRuntimeFailed {
+            reason: format!(
+                "failed to resolve compiled Core ML model {}: {error}",
+                path.display()
+            ),
+        })?;
+    if !canonical.is_dir()
+        || canonical
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("mlmodelc")
+    {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: format!(
+                "ahead-of-time Core ML model must be a .mlmodelc directory: {}",
+                canonical.display()
+            ),
+        });
+    }
+
+    autoreleasepool(|| unsafe {
+        let compiled_url = nsurl_from_path(&canonical)?;
+        let compiled_url = RetainedObjcObject::new(msg_send![compiled_url, retain]);
+        let mut last_error = String::from("MLModel load failed");
+        for compute_units in preferred_compute_units() {
+            let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
+            let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
+            let mut model: *mut Object = ptr::null_mut();
+            let mut error = [0u8; 1024];
+            let status = rustnn_coreml_load(
+                compiled_url.as_ptr(),
+                config,
+                &mut model,
+                error.as_mut_ptr().cast(),
+                error.len(),
+            );
+            let _: () = msg_send![config, release];
+            if status != 0 || model.is_null() {
+                last_error = format!("MLModel load failed: {}", shim_error_to_string(&error));
+                continue;
+            }
+            info!(
+                "loaded ahead-of-time Core ML model {} with {}",
+                canonical.display(),
+                compute_units.label()
+            );
+            return Ok(CompiledCoremlModel {
+                model,
+                compute_unit: compute_units.label(),
+                backing: CoremlModelBacking::Precompiled { path: canonical },
+            });
+        }
+        Err(GraphError::CoremlRuntimeFailed { reason: last_error })
+    })
 }
 
 /// Load a CoreML model directly from protobuf bytes and retain it for repeated
@@ -570,55 +647,7 @@ pub(crate) fn run_coreml_bytes(
     output_descriptors: &HashMap<String, OperandDescriptor>,
 ) -> Result<HashMap<String, Vec<u8>>, GraphError> {
     autoreleasepool(|| unsafe {
-        let dict: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
-
-        // Query the model's declared input types so the MLMultiArray we build matches
-        // exactly what CoreML expects. Using our own dtype codes here is unsafe: an
-        // array created with a code CoreML does not recognize (e.g. a bare `16` for
-        // Float16) is treated as Float32, so CoreML reads past our 2-bytes-per-element
-        // buffer -- garbage for small tensors, an out-of-bounds crash for large ones.
-        let model_description: *mut Object = msg_send![model.model, modelDescription];
-        let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
-
-        for (name, input) in inputs {
-            let key = nsstring_from_str(name)?;
-            let mut shape_i64: Vec<i64> = input
-                .shape
-                .iter()
-                .map(|&dimension| {
-                    i64::try_from(dimension).map_err(|_| GraphError::CoremlRuntimeFailed {
-                        reason: format!(
-                            "input `{name}` dimension {dimension} does not fit CoreML's i64 shape"
-                        ),
-                    })
-                })
-                .collect::<Result<_, _>>()?;
-            if shape_i64.is_empty() {
-                // Scalars are represented as a single-element 1-D array.
-                shape_i64.push(1);
-            }
-
-            // Prefer the model's own data type code; fall back to our mapping only when
-            // the model exposes no constraint for this input.
-            let code = model_input_dtype_code(input_descs, key)
-                .map_or_else(|| map_dtype(input.data_type), Ok)?;
-            let array = create_multi_array(&shape_i64, code)?;
-            fill_multiarray_from_bytes(array, input.data, input.data_type, code)?;
-            let feature_value: *mut Object =
-                msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
-            let () = msg_send![dict, setObject: feature_value forKey: key];
-        }
-
-        let mut create_error: *mut Object = ptr::null_mut();
-        let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
-        let provider: *mut Object =
-            msg_send![provider_alloc, initWithDictionary: dict error: &mut create_error];
-        if provider.is_null() {
-            return Err(GraphError::CoremlRuntimeFailed {
-                reason: ns_error_to_string(create_error, "MLDictionaryFeatureProvider init failed"),
-            });
-        }
-        let provider = RetainedObjcObject::new(provider);
+        let provider = create_coreml_input_provider(model.model, inputs)?;
 
         let mut output_provider: *mut Object = ptr::null_mut();
         let mut error = [0u8; 1024];
@@ -635,11 +664,131 @@ pub(crate) fn run_coreml_bytes(
             });
         }
         let output_provider = RetainedObjcObject::new(output_provider);
+        collect_coreml_byte_outputs(output_provider.as_ptr(), output_descriptors)
+    })
+}
 
+/// Run several independent input sets through one loaded Core ML model.
+pub(crate) fn run_coreml_batch_bytes(
+    model: &CompiledCoremlModel,
+    inputs: &[HashMap<String, CoremlByteInput<'_>>],
+    output_descriptors: &HashMap<String, OperandDescriptor>,
+) -> Result<Vec<HashMap<String, Vec<u8>>>, GraphError> {
+    if inputs.is_empty() {
+        return Err(GraphError::CoremlRuntimeFailed {
+            reason: "CoreML prediction batch must not be empty".to_string(),
+        });
+    }
+    autoreleasepool(|| unsafe {
+        let providers = inputs
+            .iter()
+            .map(|input| create_coreml_input_provider(model.model, input))
+            .collect::<Result<Vec<_>, _>>()?;
+        let provider_pointers = providers
+            .iter()
+            .map(RetainedObjcObject::as_ptr)
+            .collect::<Vec<_>>();
+
+        let mut output_batch: *mut Object = ptr::null_mut();
+        let mut error = [0u8; 1024];
+        let status = rustnn_coreml_predict_batch(
+            model.model,
+            provider_pointers.as_ptr(),
+            provider_pointers.len(),
+            &mut output_batch,
+            error.as_mut_ptr().cast(),
+            error.len(),
+        );
+        if status != 0 || output_batch.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!("batch prediction failed: {}", shim_error_to_string(&error)),
+            });
+        }
+        let output_batch = RetainedObjcObject::new(output_batch);
+        let output_count: isize = msg_send![output_batch.as_ptr(), count];
+        let output_count =
+            usize::try_from(output_count).map_err(|_| GraphError::CoremlRuntimeFailed {
+                reason: format!("CoreML returned an invalid batch count {output_count}"),
+            })?;
+        if output_count != inputs.len() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: format!(
+                    "CoreML returned {output_count} batch outputs for {} inputs",
+                    inputs.len()
+                ),
+            });
+        }
+
+        (0..output_count)
+            .map(|index| {
+                let provider: *mut Object =
+                    msg_send![output_batch.as_ptr(), featuresAtIndex: index];
+                if provider.is_null() {
+                    return Err(GraphError::CoremlRuntimeFailed {
+                        reason: format!("CoreML batch output {index} is nil"),
+                    });
+                }
+                collect_coreml_byte_outputs(provider, output_descriptors)
+            })
+            .collect()
+    })
+}
+
+fn create_coreml_input_provider(
+    model: *mut Object,
+    inputs: &HashMap<String, CoremlByteInput<'_>>,
+) -> Result<RetainedObjcObject, GraphError> {
+    unsafe {
+        let model_description: *mut Object = msg_send![model, modelDescription];
+        let input_descs: *mut Object = msg_send![model_description, inputDescriptionsByName];
+        let dictionary: *mut Object = msg_send![class!(NSMutableDictionary), dictionary];
+        for (name, input) in inputs {
+            let key = nsstring_from_str(name)?;
+            let mut shape = input
+                .shape
+                .iter()
+                .map(|&dimension| {
+                    i64::try_from(dimension).map_err(|_| GraphError::CoremlRuntimeFailed {
+                        reason: format!(
+                            "input `{name}` dimension {dimension} does not fit CoreML's i64 shape"
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if shape.is_empty() {
+                shape.push(1);
+            }
+            let code = model_input_dtype_code(input_descs, key)
+                .map_or_else(|| map_dtype(input.data_type), Ok)?;
+            let array = create_multi_array(&shape, code)?;
+            fill_multiarray_from_bytes(array, input.data, input.data_type, code)?;
+            let feature_value: *mut Object =
+                msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
+            let () = msg_send![dictionary, setObject: feature_value forKey: key];
+        }
+
+        let mut error: *mut Object = ptr::null_mut();
+        let provider_alloc: *mut Object = msg_send![class!(MLDictionaryFeatureProvider), alloc];
+        let provider: *mut Object =
+            msg_send![provider_alloc, initWithDictionary: dictionary error: &mut error];
+        if provider.is_null() {
+            return Err(GraphError::CoremlRuntimeFailed {
+                reason: ns_error_to_string(error, "MLDictionaryFeatureProvider init failed"),
+            });
+        }
+        Ok(RetainedObjcObject::new(provider))
+    }
+}
+
+fn collect_coreml_byte_outputs(
+    provider: *mut Object,
+    output_descriptors: &HashMap<String, OperandDescriptor>,
+) -> Result<HashMap<String, Vec<u8>>, GraphError> {
+    unsafe {
         let mut result = HashMap::with_capacity(output_descriptors.len());
         for (name, descriptor) in output_descriptors {
             let key = nsstring_from_str(name)?;
-            let value: *mut Object = msg_send![output_provider.as_ptr(), featureValueForName: key];
+            let value: *mut Object = msg_send![provider, featureValueForName: key];
             if value.is_null() {
                 return Err(GraphError::CoremlRuntimeFailed {
                     reason: format!("model did not produce output `{name}`"),
@@ -655,7 +804,7 @@ pub(crate) fn run_coreml_bytes(
             result.insert(name.clone(), bytes);
         }
         Ok(result)
-    })
+    }
 }
 
 /// Copy raw bytes into a freshly created `MLMultiArray`. The array must have been

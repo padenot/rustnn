@@ -114,4 +114,48 @@ int rustnn_coreml_predict(void *model, void *features, void **out_provider, char
     }
 }
 
+// Run several independent predictions through one loaded MLModel. Core ML owns
+// scheduling across the compute device; every item still uses the model's
+// ordinary single-example feature shape.
+int rustnn_coreml_predict_batch(void *model, void *const *features, size_t feature_count,
+                                void **out_batch, char *err, size_t err_len) {
+    *out_batch = NULL;
+    @try {
+        if (feature_count == 0) {
+            rustnn_copy_err(err, err_len, @"CoreML prediction batch is empty");
+            return 1;
+        }
+        NSMutableArray<id<MLFeatureProvider>> *providers =
+            [NSMutableArray arrayWithCapacity:feature_count];
+        for (size_t index = 0; index < feature_count; ++index) {
+            id<MLFeatureProvider> provider = (__bridge id<MLFeatureProvider>)features[index];
+            if (provider == nil) {
+                rustnn_copy_err(err, err_len, @"CoreML prediction batch contains a nil provider");
+                return 1;
+            }
+            [providers addObject:provider];
+        }
+        MLArrayBatchProvider *input =
+            [[MLArrayBatchProvider alloc] initWithFeatureProviderArray:providers];
+        NSError *nserr = nil;
+        id<MLBatchProvider> output =
+            [(__bridge MLModel *)model predictionsFromBatch:input error:&nserr];
+        if (output == nil) {
+            rustnn_copy_err(err, err_len,
+                            nserr ? [nserr localizedDescription] : @"batch prediction returned nil");
+            return 1;
+        }
+        *out_batch = (__bridge_retained void *)output;
+        return 0;
+    } @catch (NSException *e) {
+        rustnn_copy_err(err, err_len,
+                        [NSString stringWithFormat:@"%@: %@", e.name, e.reason]);
+        return 2;
+    } @catch (...) {
+        rustnn_copy_err(err, err_len,
+                        @"caught non-Objective-C exception during CoreML batch prediction");
+        return 3;
+    }
+}
+
 } // extern "C"

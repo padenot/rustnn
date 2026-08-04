@@ -37,6 +37,12 @@ pub(crate) trait ListDevices {
 }
 
 // could make public later if interface stabilized
+pub(crate) type MLNamedTensorBindings<'name, 'tensor> = HashMap<&'name str, &'tensor MLTensor>;
+pub(crate) type MLDispatchBindings<'maps, 'name, 'tensor> = (
+    &'maps MLNamedTensorBindings<'name, 'tensor>,
+    &'maps MLNamedTensorBindings<'name, 'tensor>,
+);
+
 pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
     fn accelerated(&self) -> bool;
     fn create_builder<'builder>(
@@ -66,6 +72,16 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
         inputs: &HashMap<&str, &MLTensor>,
         outputs: &HashMap<&str, &MLTensor>,
     ) -> Result<()>;
+    fn dispatch_batch(
+        &mut self,
+        graph: &mut MLGraph,
+        bindings: &[MLDispatchBindings<'_, '_, '_>],
+    ) -> Result<()> {
+        for (inputs, outputs) in bindings {
+            self.dispatch(graph, inputs, outputs)?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) trait MLBackendBuilder<'context, 'builder>: std::fmt::Debug + Send {
@@ -525,21 +541,28 @@ impl<'context> MLContext<'context> {
         outputs: &HashMap<&str, &MLTensor>,
     ) -> crate::error::Result<()> {
         debug!("Dispatch {graph:?}, inputs={inputs:?}, outputs={outputs:?}");
-        //https://www.w3.org/TR/webnn/#dom-mlcontext-dispatch
-        // spec: 4. If allTensors contains any duplicate items, then throw a TypeError.
-        let mut all_tensor_ids = HashMap::new();
-        for (&name, &tensor) in inputs.iter().chain(outputs.iter()) {
-            if let Some(other_name) = all_tensor_ids.insert(name, tensor.id) {
-                return Err(Error::DuplicateTensorBinding {
-                    aliased_tensor: tensor.clone(),
-                    first_binding: other_name.to_string(),
-                    other_binding: name.to_string(),
-                });
-            }
-        }
-
-        graph.verify_dispatch_bindings(inputs, outputs)?;
+        verify_dispatch_bindings(graph, inputs, outputs)?;
         self.backend.dispatch(graph, inputs, outputs)
+    }
+
+    /// Dispatch several independent input/output binding sets through one graph.
+    ///
+    /// Backends with a native batch-prediction API may schedule the group as one
+    /// operation. Other backends preserve correctness by dispatching each item.
+    pub fn dispatch_batch(
+        &mut self,
+        graph: &mut MLGraph,
+        bindings: &[MLDispatchBindings<'_, '_, '_>],
+    ) -> crate::error::Result<()> {
+        if bindings.is_empty() {
+            return Err(Error::GraphDispatchError {
+                source: "dispatch batch must not be empty".into(),
+            });
+        }
+        for (inputs, outputs) in bindings {
+            verify_dispatch_bindings(graph, inputs, outputs)?;
+        }
+        self.backend.dispatch_batch(graph, bindings)
     }
 
     pub fn op_support_limits(&self) -> MLOpSupportLimits {
@@ -605,6 +628,26 @@ impl<'context> MLContext<'context> {
     ) -> Result<()> {
         self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
     }
+}
+
+fn verify_dispatch_bindings(
+    graph: &mut MLGraph,
+    inputs: &HashMap<&str, &MLTensor>,
+    outputs: &HashMap<&str, &MLTensor>,
+) -> crate::error::Result<()> {
+    // https://www.w3.org/TR/webnn/#dom-mlcontext-dispatch
+    // If allTensors contains duplicate tensor objects, dispatch must fail.
+    let mut bound_tensor_ids = HashMap::new();
+    for (&name, &tensor) in inputs.iter().chain(outputs.iter()) {
+        if let Some(other_name) = bound_tensor_ids.insert(tensor.id, name) {
+            return Err(Error::DuplicateTensorBinding {
+                aliased_tensor: tensor.clone(),
+                first_binding: other_name.to_string(),
+                other_binding: name.to_string(),
+            });
+        }
+    }
+    graph.verify_dispatch_bindings(inputs, outputs)
 }
 
 #[cfg(test)]
@@ -723,20 +766,51 @@ webnn_graph "sample_graph" v1 {
         dbg!(&context);
         let desc = rw_tensor_desc([2, 2].to_vec());
 
-        let tensor = context.create_tensor(&desc).unwrap();
+        let input_tensor = context.create_tensor(&desc).unwrap();
+        let output_tensor = context.create_tensor(&desc).unwrap();
         let mut inputs = HashMap::new();
-        inputs.insert("lhs", &tensor);
+        inputs.insert("lhs", &input_tensor);
         let mut outputs = HashMap::new();
-        outputs.insert("sum", &tensor);
+        outputs.insert("sum", &output_tensor);
 
         let upload = vec![1.0f32, 2., 3., 4.];
         let upload_f64 = vec![1.0, 2., 3., 4.];
         let mut download = vec![0.0f32; 4];
-        context.write_tensor(&tensor, &upload_f64).unwrap_err();
-        context.write_tensor(&tensor, &upload).unwrap();
+        context
+            .write_tensor(&input_tensor, &upload_f64)
+            .unwrap_err();
+        context.write_tensor(&input_tensor, &upload).unwrap();
         context.dispatch(&mut graph, &inputs, &outputs).unwrap();
-        context.read_tensor(&tensor, &mut download).unwrap();
+        context.read_tensor(&output_tensor, &mut download).unwrap();
         assert_eq!(&vec![2.0f32, 3., 4., 5.], &download);
+    }
+
+    #[test]
+    fn test_dispatch_rejects_duplicate_tensor_bindings() -> crate::error::Result<()> {
+        let Some((mut context, mut graph)) = create_add_graph_context_and_graph() else {
+            return Ok(());
+        };
+        let tensor = context.create_tensor(&rw_tensor_desc(vec![2, 2]))?;
+        let inputs = HashMap::from([("lhs", &tensor)]);
+        let outputs = HashMap::from([("sum", &tensor)]);
+
+        let error = match context.dispatch(&mut graph, &inputs, &outputs) {
+            Ok(()) => {
+                return Err(crate::error::Error::GraphDispatchError {
+                    source: "duplicate tensor bindings were accepted".into(),
+                });
+            }
+            Err(error) => error,
+        };
+        std::assert_matches!(
+            error,
+            crate::error::Error::DuplicateTensorBinding {
+                first_binding,
+                other_binding,
+                ..
+            } if first_binding == "lhs" && other_binding == "sum"
+        );
+        Ok(())
     }
 
     #[cfg(feature = "trtx-runtime")]
@@ -779,11 +853,12 @@ webnn_graph "sample_graph" v1 {
         };
 
         let desc = rw_tensor_desc([2, 2].to_vec());
-        let tensor = context.create_tensor(&desc).unwrap();
+        let input_tensor = context.create_tensor(&desc).unwrap();
+        let output_tensor = context.create_tensor(&desc).unwrap();
         let mut inputs = HashMap::new();
-        inputs.insert("invalid_input", &tensor);
+        inputs.insert("invalid_input", &input_tensor);
         let mut outputs = HashMap::new();
-        outputs.insert("sum", &tensor);
+        outputs.insert("sum", &output_tensor);
 
         let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
         std::assert_matches!(
@@ -800,11 +875,12 @@ webnn_graph "sample_graph" v1 {
         };
 
         let desc = rw_tensor_desc([2, 3].to_vec());
-        let tensor = context.create_tensor(&desc).unwrap();
+        let input_tensor = context.create_tensor(&desc).unwrap();
+        let output_tensor = context.create_tensor(&desc).unwrap();
         let mut inputs = HashMap::new();
-        inputs.insert("lhs", &tensor);
+        inputs.insert("lhs", &input_tensor);
         let mut outputs = HashMap::new();
-        outputs.insert("sum", &tensor);
+        outputs.insert("sum", &output_tensor);
 
         let err = context.dispatch(&mut graph, &inputs, &outputs).unwrap_err();
         std::assert_matches!(

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 
 use log::debug;
 
@@ -17,13 +18,14 @@ use crate::backend_selection::DeviceType;
 use crate::converters::{CoremlMlProgramConverter, GraphConverter};
 use crate::error::Error;
 use crate::executors::coreml::{
-    CompiledCoremlModel, CoremlByteInput, compile_model, run_coreml_bytes,
+    CompiledCoremlModel, CoremlByteInput, compile_model, load_compiled_model,
+    run_coreml_batch_bytes, run_coreml_bytes,
 };
 use crate::graph::DataType;
-use crate::mlcontext::RustNNOptions;
 use crate::mlcontext::{
     MLBackendBuilder, MLBackendContext, MLBackendGraph, MLGraph, MLTensor, MLTensorDescriptor,
 };
+use crate::mlcontext::{MLDispatchBindings, RustNNOptions};
 use crate::operators::Operation;
 
 /// Number of bytes required to store a tensor described by `descriptor`.
@@ -52,28 +54,40 @@ impl fmt::Debug for CoremlGraph {
 
 pub(crate) struct CoremlBuilder {
     device_type: DeviceType,
+    compiled_model_path: Option<PathBuf>,
 }
 
 impl fmt::Debug for CoremlBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CoremlBuilder")
             .field("device_type", &self.device_type)
+            .field("compiled_model_path", &self.compiled_model_path)
             .finish()
     }
 }
 
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
-        let converted = CoremlMlProgramConverter
-            .convert(&graph_info)
-            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
-        let model = compile_model(
-            &converted.data,
-            converted.weights_data.as_deref(),
-            self.device_type,
-            supports_in_memory_asset(&graph_info),
-        )
-        .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let model = if let Some(path) = &self.compiled_model_path {
+            load_compiled_model(path).map_err(|error| Error::GraphBuildError {
+                source: error.into(),
+            })?
+        } else {
+            let converted = CoremlMlProgramConverter
+                .convert(&graph_info)
+                .map_err(|error| Error::GraphBuildError {
+                    source: error.into(),
+                })?;
+            compile_model(
+                &converted.data,
+                converted.weights_data.as_deref(),
+                self.device_type,
+                supports_in_memory_asset(&graph_info),
+            )
+            .map_err(|error| Error::GraphBuildError {
+                source: error.into(),
+            })?
+        };
         MLGraph::new(
             MLBackendGraph::CoremlModel(CoremlGraph { model }),
             &graph_info,
@@ -104,18 +118,133 @@ fn supports_in_memory_asset(graph: &GraphInfo) -> bool {
 #[derive(Debug)]
 pub(crate) struct CoremlContext {
     device_type: DeviceType,
+    compiled_model_path: Option<PathBuf>,
     tensors: Vec<CoremlTensor>,
 }
 
 impl CoremlContext {
     pub(crate) fn new_from_device_type(
         device_type: DeviceType,
-        _options: Option<&RustNNOptions>,
+        options: Option<&RustNNOptions>,
     ) -> crate::error::Result<Self> {
         Ok(Self {
             device_type,
+            compiled_model_path: options
+                .and_then(|options| options.coreml.compiled_model_path.clone()),
             tensors: Vec::new(),
         })
+    }
+
+    fn byte_inputs<'a>(
+        &'a self,
+        input_descriptors: &HashMap<String, crate::OperandDescriptor>,
+        inputs: &'a HashMap<&str, &MLTensor>,
+    ) -> crate::error::Result<HashMap<String, CoremlByteInput<'a>>> {
+        let mut byte_inputs = HashMap::with_capacity(input_descriptors.len());
+        for name in input_descriptors.keys() {
+            let tensor = inputs
+                .get(name.as_str())
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: format!("missing input '{name}' for CoreML dispatch").into(),
+                })?;
+            let logical = tensor.rustnn_required_bytes();
+            let full = &self.tensors[tensor.id].memory;
+            let bytes = full
+                .get(..logical)
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: format!(
+                        "input '{name}': tensor buffer shorter than logical size ({logical} bytes)"
+                    )
+                    .into(),
+                })?;
+            debug!(
+                target: "rustnn::backends::coreml",
+                "dispatch input '{}' tensor_id={} shape={:?} logical_bytes={}",
+                name,
+                tensor.id,
+                tensor.shape(),
+                logical
+            );
+            byte_inputs.insert(
+                name.clone(),
+                CoremlByteInput {
+                    data: bytes,
+                    data_type: tensor.data_type().into(),
+                    shape: tensor.shape(),
+                },
+            );
+        }
+        Ok(byte_inputs)
+    }
+
+    fn write_outputs(
+        &mut self,
+        outputs: &HashMap<&str, &MLTensor>,
+        output_bytes: &HashMap<String, Vec<u8>>,
+    ) -> crate::error::Result<()> {
+        for (&name, ml_tensor) in outputs {
+            let data = output_bytes
+                .get(name)
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: format!("model did not produce output '{name}'").into(),
+                })?;
+            let logical = tensor_byte_len(ml_tensor.descriptor());
+
+            // Core ML represents these WebNN outputs as int32. Widen them at
+            // the backend boundary so host tensors retain their declared type.
+            use crate::operator_enums::MLOperandDataType;
+            let output_type = ml_tensor.descriptor().data_type();
+            let expanded = if data.len().checked_mul(2) == Some(logical)
+                && matches!(
+                    output_type,
+                    MLOperandDataType::Int64 | MLOperandDataType::Uint64
+                ) {
+                let sign_extend = output_type == MLOperandDataType::Int64;
+                let mut buffer = Vec::with_capacity(logical);
+                for bytes in data.chunks_exact(4) {
+                    let [first, second, third, fourth] = bytes else {
+                        return Err(Error::GraphDispatchError {
+                            source: format!(
+                                "output '{name}': CoreML returned a partial int32 value"
+                            )
+                            .into(),
+                        });
+                    };
+                    let value = i32::from_le_bytes([*first, *second, *third, *fourth]);
+                    let widened = if sign_extend {
+                        i64::from(value)
+                    } else {
+                        i64::from(value as u32)
+                    };
+                    buffer.extend_from_slice(&widened.to_le_bytes());
+                }
+                Some(buffer)
+            } else {
+                None
+            };
+            let effective = expanded.as_deref().unwrap_or(data);
+            if effective.len() < logical {
+                return Err(Error::GraphDispatchError {
+                    source: format!(
+                        "output '{name}': CoreML produced {} bytes, descriptor expects {logical}",
+                        data.len()
+                    )
+                    .into(),
+                });
+            }
+            let destination = &mut self.tensors[ml_tensor.id].memory;
+            if destination.len() < logical {
+                return Err(Error::GraphDispatchError {
+                    source: format!(
+                        "output '{name}': storage too small ({} bytes) for {logical} logical bytes",
+                        destination.len()
+                    )
+                    .into(),
+                });
+            }
+            destination[..logical].copy_from_slice(&effective[..logical]);
+        }
+        Ok(())
     }
 }
 
@@ -132,6 +261,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
     {
         Ok(Box::new(CoremlBuilder {
             device_type: self.device_type,
+            compiled_model_path: self.compiled_model_path.clone(),
         }))
     }
 
@@ -208,113 +338,60 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
         inputs: &HashMap<&str, &MLTensor>,
         outputs: &HashMap<&str, &MLTensor>,
     ) -> crate::error::Result<()> {
-        // Gather raw-byte inputs keyed by feature name, then run; the borrow of
-        // `self.tensors` is released before we write outputs back.
-        let out_bytes = {
-            let coreml_graph =
-                graph
-                    .backend
-                    .as_coreml_model()
-                    .ok_or_else(|| Error::GraphDispatchError {
-                        source: "MLGraph is not a CoreML model graph".into(),
-                    })?;
-
-            let mut byte_inputs: HashMap<String, CoremlByteInput> =
-                HashMap::with_capacity(graph.input_descriptors.len());
-            for name in graph.input_descriptors.keys() {
-                let tensor =
-                    inputs
-                        .get(name.as_str())
-                        .ok_or_else(|| Error::GraphDispatchError {
-                            source: format!("missing input '{name}' for CoreML dispatch").into(),
-                        })?;
-                let logical = tensor.rustnn_required_bytes();
-                let full = &self.tensors[tensor.id].memory;
-                let bytes = full
-                    .get(..logical)
-                    .ok_or_else(|| Error::GraphDispatchError {
-                        source: format!(
-                            "input '{name}': tensor buffer shorter than logical size ({logical} bytes)"
-                        )
-                        .into(),
-                    })?;
-                debug!(
-                    target: "rustnn::backends::coreml",
-                    "dispatch input '{}' tensor_id={} shape={:?} logical_bytes={}",
-                    name,
-                    tensor.id,
-                    tensor.shape(),
-                    logical
-                );
-                byte_inputs.insert(
-                    name.clone(),
-                    CoremlByteInput {
-                        data: bytes,
-                        data_type: tensor.data_type().into(),
-                        shape: tensor.shape(),
-                    },
-                );
-            }
-
-            run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
-                .map_err(|e| Error::GraphDispatchError { source: e.into() })?
-        };
-
-        for (&name, ml_tensor) in outputs.iter() {
-            let data = out_bytes
-                .get(name)
+        let byte_inputs = self.byte_inputs(&graph.input_descriptors, inputs)?;
+        let coreml_graph =
+            graph
+                .backend
+                .as_coreml_model()
                 .ok_or_else(|| Error::GraphDispatchError {
-                    source: format!("model did not produce output '{name}'").into(),
+                    source: "MLGraph is not a CoreML model graph".into(),
                 })?;
-            let logical = tensor_byte_len(ml_tensor.descriptor());
+        let output_bytes =
+            run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
+                .map_err(|error| Error::GraphDispatchError {
+                    source: error.into(),
+                })?;
+        drop(byte_inputs);
+        self.write_outputs(outputs, &output_bytes)
+    }
 
-            // When the graph output type is int64/uint64 but CoreML produced int32
-            // bytes (argmin/argmax proxy, or a cast to int64/uint64), widen each
-            // 4-byte value to 8 bytes. int64 is sign-extended so negative results
-            // survive; uint64 is zero-extended.
-            use crate::operator_enums::MLOperandDataType;
-            let out_dt = ml_tensor.descriptor().data_type();
-            let expanded: Option<Vec<u8>> = if data.len() * 2 == logical
-                && matches!(out_dt, MLOperandDataType::Int64 | MLOperandDataType::Uint64)
-            {
-                let sign_extend = matches!(out_dt, MLOperandDataType::Int64);
-                let count = data.len() / 4;
-                let mut buf = vec![0u8; count * 8];
-                for i in 0..count {
-                    let v = i32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
-                    let widened: i64 = if sign_extend {
-                        v as i64
-                    } else {
-                        i64::from(v as u32)
-                    };
-                    buf[i * 8..i * 8 + 8].copy_from_slice(&widened.to_le_bytes());
-                }
-                Some(buf)
-            } else {
-                None
-            };
-            let effective = expanded.as_deref().unwrap_or(data.as_slice());
-
-            if effective.len() < logical {
-                return Err(Error::GraphDispatchError {
-                    source: format!(
-                        "output '{name}': CoreML produced {} bytes, descriptor expects {logical}",
-                        data.len()
-                    )
-                    .into(),
-                });
-            }
-            let dst = &mut self.tensors[ml_tensor.id].memory;
-            if dst.len() < logical {
-                return Err(Error::GraphDispatchError {
-                    source: format!(
-                        "output '{name}': storage too small ({} bytes) for {logical} logical bytes",
-                        dst.len()
-                    )
-                    .into(),
-                });
-            }
-            dst[..logical].copy_from_slice(&effective[..logical]);
+    fn dispatch_batch(
+        &mut self,
+        graph: &mut MLGraph,
+        bindings: &[MLDispatchBindings<'_, '_, '_>],
+    ) -> crate::error::Result<()> {
+        let batch_inputs = bindings
+            .iter()
+            .map(|(inputs, _)| self.byte_inputs(&graph.input_descriptors, inputs))
+            .collect::<crate::error::Result<Vec<_>>>()?;
+        let coreml_graph =
+            graph
+                .backend
+                .as_coreml_model()
+                .ok_or_else(|| Error::GraphDispatchError {
+                    source: "MLGraph is not a CoreML model graph".into(),
+                })?;
+        let batch_outputs = run_coreml_batch_bytes(
+            &coreml_graph.model,
+            &batch_inputs,
+            &graph.output_descriptors,
+        )
+        .map_err(|error| Error::GraphDispatchError {
+            source: error.into(),
+        })?;
+        drop(batch_inputs);
+        if batch_outputs.len() != bindings.len() {
+            return Err(Error::GraphDispatchError {
+                source: format!(
+                    "CoreML returned {} output batches for {} bindings",
+                    batch_outputs.len(),
+                    bindings.len()
+                )
+                .into(),
+            });
+        }
+        for ((_, outputs), output_bytes) in bindings.iter().zip(&batch_outputs) {
+            self.write_outputs(outputs, output_bytes)?;
         }
         Ok(())
     }

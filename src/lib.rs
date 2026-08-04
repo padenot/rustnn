@@ -28,6 +28,7 @@ pub use executors::coreml;
 pub use converters::litert::LiteRtConverter;
 pub use converters::{
     ConvertedGraph, ConverterRegistry, GraphConverter, ONNX_EXTERNAL_WEIGHTS_FILENAME,
+    save_coreml_package,
 };
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 pub use coreml::{CoremlOutput, CoremlRunAttempt, run_coreml_zeroed, run_coreml_zeroed_cached};

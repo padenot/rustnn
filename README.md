@@ -100,6 +100,15 @@ context = ml.create_context(accelerated=True, power_preference="low-power")
 - GPU: ONNX Runtime GPU (cross-platform) or CoreML GPU (macOS)
 - CPU: ONNX Runtime CPU (cross-platform)
 
+### Ahead-of-time Core ML
+
+Build tooling can convert a validated graph with `CoremlMlProgramConverter`, write a deterministic
+source package with `save_coreml_package`, and invoke Apple's `coremlcompiler` before shipping.
+Set `CoremlOptions::compiled_model_path` when constructing the runtime context to load the
+resulting `.mlmodelc` directly; no graph conversion or Core ML compilation then occurs in the
+application process. `MLContext::dispatch_batch` submits independent binding sets through the one
+loaded model using Core ML's native batch API.
+
 ## Examples
 
 ### Complete MobileNetV2 Image Classification
