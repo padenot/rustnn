@@ -323,10 +323,11 @@ impl Drop for CompiledCoremlModel {
     }
 }
 
-/// Raw-byte input for [`run_coreml_bytes`]: a tensor's bytes plus its descriptor.
+/// Raw-byte input for [`run_coreml_bytes`] with the concrete dispatch shape.
 pub(crate) struct CoremlByteInput<'a> {
     pub(crate) data: &'a [u8],
-    pub(crate) descriptor: &'a OperandDescriptor,
+    pub(crate) data_type: DataType,
+    pub(crate) shape: &'a [u64],
 }
 
 /// Map a [`DeviceType`] to a strongly typed Core ML compute-unit policy.
@@ -582,11 +583,16 @@ pub(crate) fn run_coreml_bytes(
         for (name, input) in inputs {
             let key = nsstring_from_str(name)?;
             let mut shape_i64: Vec<i64> = input
-                .descriptor
-                .static_or_max_shape()
+                .shape
                 .iter()
-                .map(|&d| i64::from(d))
-                .collect();
+                .map(|&dimension| {
+                    i64::try_from(dimension).map_err(|_| GraphError::CoremlRuntimeFailed {
+                        reason: format!(
+                            "input `{name}` dimension {dimension} does not fit CoreML's i64 shape"
+                        ),
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             if shape_i64.is_empty() {
                 // Scalars are represented as a single-element 1-D array.
                 shape_i64.push(1);
@@ -595,9 +601,9 @@ pub(crate) fn run_coreml_bytes(
             // Prefer the model's own data type code; fall back to our mapping only when
             // the model exposes no constraint for this input.
             let code = model_input_dtype_code(input_descs, key)
-                .map_or_else(|| map_dtype(input.descriptor.data_type), Ok)?;
+                .map_or_else(|| map_dtype(input.data_type), Ok)?;
             let array = create_multi_array(&shape_i64, code)?;
-            fill_multiarray_from_bytes(array, input.data, input.descriptor.data_type, code)?;
+            fill_multiarray_from_bytes(array, input.data, input.data_type, code)?;
             let feature_value: *mut Object =
                 msg_send![class!(MLFeatureValue), featureValueWithMultiArray: array];
             let () = msg_send![dict, setObject: feature_value forKey: key];

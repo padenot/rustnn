@@ -221,19 +221,14 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 
             let mut byte_inputs: HashMap<String, CoremlByteInput> =
                 HashMap::with_capacity(graph.input_descriptors.len());
-            for (name, descriptor) in graph.input_descriptors.iter() {
+            for name in graph.input_descriptors.keys() {
                 let tensor =
                     inputs
                         .get(name.as_str())
                         .ok_or_else(|| Error::GraphDispatchError {
                             source: format!("missing input '{name}' for CoreML dispatch").into(),
                         })?;
-                let logical =
-                    descriptor
-                        .byte_length()
-                        .ok_or_else(|| Error::GraphDispatchError {
-                            source: format!("input '{name}': cannot compute byte length").into(),
-                        })?;
+                let logical = tensor.rustnn_required_bytes();
                 let full = &self.tensors[tensor.id].memory;
                 let bytes = full
                     .get(..logical)
@@ -255,7 +250,8 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     name.clone(),
                     CoremlByteInput {
                         data: bytes,
-                        descriptor,
+                        data_type: tensor.data_type().into(),
+                        shape: tensor.shape(),
                     },
                 );
             }
@@ -366,12 +362,16 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
 mod test {
     use std::collections::HashMap;
 
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::graph::{Dimension, DynamicDimension, Operand, OperandDescriptor, OperandKind};
     use crate::mlcontext::{
         Backend, MLContext, MLContextOptions, MLOperandDescriptor, MLPowerPreference,
         MLTensorDescriptor,
     };
     use crate::mlgraphbuilder::MLGraphBuilder;
     use crate::operator_enums::MLOperandDataType;
+    #[cfg(feature = "dynamic-inputs")]
+    use crate::{DataType, GraphInfo, Operation};
 
     /// Build a context backed by CoreML. Returns `None` (test skipped) if no
     /// accelerated backend is available on this machine.
@@ -483,5 +483,72 @@ mod test {
         let mut result = vec![0i32; 4];
         context.read_tensor(&out, &mut result).unwrap();
         assert_eq!(result, &[11, 22, 33, 44]);
+    }
+
+    #[cfg(feature = "dynamic-inputs")]
+    #[test]
+    fn coreml_dispatch_uses_actual_dynamic_batch_shape() -> crate::error::Result<()> {
+        let _ = pretty_env_logger::try_init();
+        let Some(mut context) = coreml_context() else {
+            return Ok(());
+        };
+
+        let graph_shape = vec![
+            Dimension::Dynamic(DynamicDimension {
+                name: "batch_size".to_string(),
+                max_size: 8,
+            }),
+            Dimension::Static(4),
+        ];
+        let graph_info = GraphInfo {
+            operands: vec![
+                Operand {
+                    name: Some("input".to_string()),
+                    kind: OperandKind::Input,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: graph_shape.clone(),
+                        pending_permutation: Vec::new(),
+                    },
+                },
+                Operand {
+                    name: Some("output".to_string()),
+                    kind: OperandKind::Output,
+                    descriptor: OperandDescriptor {
+                        data_type: DataType::Float32,
+                        shape: graph_shape,
+                        pending_permutation: Vec::new(),
+                    },
+                },
+            ],
+            input_operands: vec![0],
+            output_operands: vec![1],
+            operations: vec![Operation::Identity {
+                input: 0,
+                options: None,
+                outputs: vec![1],
+            }],
+            ..GraphInfo::default()
+        };
+
+        let mut builder = MLGraphBuilder::new(&mut context)?;
+        let mut graph = builder.build_graph_info(graph_info)?;
+        let mut input_descriptor = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![2, 4]);
+        input_descriptor.set_writable(true);
+        let mut output_descriptor = MLTensorDescriptor::new(MLOperandDataType::Float32, vec![2, 4]);
+        output_descriptor.set_readable(true);
+        let input = context.create_tensor(&input_descriptor)?;
+        let output = context.create_tensor(&output_descriptor)?;
+        let values = [-4.0f32, -3.0, -2.0, -1.0, 1.0, 2.0, 3.0, 4.0];
+        context.write_tensor(&input, &values)?;
+
+        let inputs = HashMap::from([("input", &input)]);
+        let outputs = HashMap::from([("output", &output)]);
+        context.dispatch(&mut graph, &inputs, &outputs)?;
+
+        let mut result = [0.0f32; 8];
+        context.read_tensor(&output, &mut result)?;
+        assert_eq!(result, values);
+        Ok(())
     }
 }

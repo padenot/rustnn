@@ -4702,7 +4702,11 @@ impl CoremlMlProgramConverter {
     fn create_feature_type(
         descriptor: &crate::graph::OperandDescriptor,
     ) -> Result<crate::protos::coreml::specification::FeatureType, GraphError> {
-        use crate::protos::coreml::specification::{ArrayFeatureType, FeatureType, feature_type};
+        use crate::protos::coreml::specification::{
+            ArrayFeatureType, FeatureType, SizeRange,
+            array_feature_type::{ShapeFlexibility, ShapeRange},
+            feature_type,
+        };
 
         // Map WebNN data type to CoreML array data type
         // CoreML feature descriptions (I/O) ONLY support: DOUBLE, FLOAT32, FLOAT16, INT32
@@ -4746,6 +4750,25 @@ impl CoremlMlProgramConverter {
 
         for &dim in &shape_to_use {
             array_feature.shape.push(dim as i64);
+        }
+
+        if descriptor.has_dynamic_dimensions() {
+            let size_ranges = descriptor
+                .shape
+                .iter()
+                .map(|dimension| match dimension {
+                    GraphDimension::Static(size) => SizeRange {
+                        lower_bound: u64::from(*size),
+                        upper_bound: i64::from(*size),
+                    },
+                    GraphDimension::Dynamic(dynamic) => SizeRange {
+                        lower_bound: 1,
+                        upper_bound: i64::from(dynamic.max_size),
+                    },
+                })
+                .collect();
+            array_feature.shape_flexibility =
+                Some(ShapeFlexibility::ShapeRange(ShapeRange { size_ranges }));
         }
 
         Ok(FeatureType {
