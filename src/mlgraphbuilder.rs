@@ -20,7 +20,7 @@ use crate::operator_options::{
 };
 use crate::shape_inference::{
     InputLayout, ReduceOptions, SplitSpec, infer_concat_shape_dimensions,
-    infer_conv_transpose2d_shape, infer_conv2d_shape, infer_expand_shape_dimensions,
+    infer_conv_transpose2d_shape, infer_conv2d_shape_dimensions, infer_expand_shape_dimensions,
     infer_gather_shape_dimensions, infer_gemm_shape_dimensions, infer_global_pool_shape,
     infer_matmul_shape_dimensions, infer_pad_shape, infer_pool2d_shape_dimensions,
     infer_prelu_shape, infer_reduce_shape_dimensions, infer_resample2d_shape,
@@ -618,12 +618,11 @@ fn conv2d_shape(
     let shape = infer_shape_err(
         "conv2d",
         operation,
-        infer_conv2d_shape(
-            &shape_dims_u32(&input_op.descriptor.shape),
-            &shape_dims_u32(&filter_op.descriptor.shape),
+        infer_conv2d_shape_dimensions(
+            &input_op.descriptor.shape,
+            &filter_op.descriptor.shape,
             &opts,
-        )
-        .map(|v| to_dimension_vector(&v)),
+        ),
     )?;
     Ok(OperandDescriptor {
         data_type: input_op.descriptor.data_type,

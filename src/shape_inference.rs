@@ -1,6 +1,6 @@
 /// Shape inference and validation for WebNN operations
 use crate::error::GraphError;
-use crate::graph::{Dimension, DynamicDimension, get_static_or_max_size, to_dimension_vector};
+use crate::graph::{Dimension, DynamicDimension, get_static_or_max_size};
 use crate::operator_options::{MLConv2dOptions, MLConvTranspose2dOptions, MLPool2dOptions};
 
 /// Compute the broadcasted shape for two operands following NumPy broadcasting rules
@@ -484,6 +484,149 @@ pub fn infer_conv2d_shape(
     Ok(output_shape)
 }
 
+/// Infer the output shape for 2D convolution while preserving dynamic spatial dimensions.
+pub fn infer_conv2d_shape_dimensions(
+    input_shape: &[Dimension],
+    filter_shape: &[Dimension],
+    options: &MLConv2dOptions,
+) -> Result<Vec<Dimension>, GraphError> {
+    let input_max = input_shape
+        .iter()
+        .map(get_static_or_max_size)
+        .collect::<Vec<_>>();
+    let filter_max = filter_shape
+        .iter()
+        .map(get_static_or_max_size)
+        .collect::<Vec<_>>();
+    let output_max = infer_conv2d_shape(&input_max, &filter_max, options)?;
+    let [batch, input_first, input_second, input_third] = input_shape else {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!("Conv2d input must be 4D, got shape {input_shape:?}"),
+        });
+    };
+    let [filter_first, filter_second, filter_third, filter_fourth] = filter_max.as_slice() else {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!("Conv2d filter must be 4D, got shape {filter_max:?}"),
+        });
+    };
+    let [_output_first, output_second, output_third, output_fourth] = output_max.as_slice() else {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!("Conv2d produced an invalid output shape {output_max:?}"),
+        });
+    };
+
+    let input_layout = conv2d_input_layout_from_options(&options.input_layout);
+    let filter_layout = conv2d_filter_layout_from_options(&options.filter_layout);
+    let (input_h, input_w, output_h, output_w, output_channels) = match input_layout {
+        InputLayout::Nchw => (
+            input_second,
+            input_third,
+            *output_third,
+            *output_fourth,
+            *output_second,
+        ),
+        InputLayout::Nhwc => (
+            input_first,
+            input_second,
+            *output_second,
+            *output_third,
+            *output_fourth,
+        ),
+    };
+    let (kernel_h, kernel_w) = match filter_layout {
+        Conv2dFilterLayout::Oihw => (*filter_third, *filter_fourth),
+        Conv2dFilterLayout::Hwio => (*filter_first, *filter_second),
+        Conv2dFilterLayout::Ohwi | Conv2dFilterLayout::Ihwo => (*filter_second, *filter_third),
+    };
+    let strides = spatial_pair(&options.strides, [1, 1], "Conv2d strides")?;
+    let dilations = spatial_pair(&options.dilations, [1, 1], "Conv2d dilations")?;
+    let padding = spatial_padding(&options.padding, "Conv2d padding")?;
+    let [stride_h, stride_w] = strides;
+    let [dilation_h, dilation_w] = dilations;
+    let [pad_begin_h, pad_end_h, pad_begin_w, pad_end_w] = padding;
+    let height = infer_spatial_dimension(
+        input_h,
+        output_h,
+        kernel_h,
+        stride_h,
+        dilation_h,
+        pad_begin_h,
+        pad_end_h,
+    );
+    let width = infer_spatial_dimension(
+        input_w,
+        output_w,
+        kernel_w,
+        stride_w,
+        dilation_w,
+        pad_begin_w,
+        pad_end_w,
+    );
+    Ok(match input_layout {
+        InputLayout::Nchw => vec![
+            batch.clone(),
+            Dimension::Static(output_channels),
+            height,
+            width,
+        ],
+        InputLayout::Nhwc => vec![
+            batch.clone(),
+            height,
+            width,
+            Dimension::Static(output_channels),
+        ],
+    })
+}
+
+fn spatial_pair(values: &[u32], default: [u32; 2], label: &str) -> Result<[u32; 2], GraphError> {
+    match values {
+        [] => Ok(default),
+        [first, second] if *first > 0 && *second > 0 => Ok([*first, *second]),
+        _ => Err(GraphError::ShapeInferenceFailed {
+            reason: format!("{label} must contain two positive values, got {values:?}"),
+        }),
+    }
+}
+
+fn spatial_padding(values: &[u32], label: &str) -> Result<[u32; 4], GraphError> {
+    match values {
+        [] => Ok([0; 4]),
+        [begin_h, end_h, begin_w, end_w] => Ok([*begin_h, *end_h, *begin_w, *end_w]),
+        _ => Err(GraphError::ShapeInferenceFailed {
+            reason: format!("{label} must contain four values, got {values:?}"),
+        }),
+    }
+}
+
+fn infer_spatial_dimension(
+    input: &Dimension,
+    output_max: u32,
+    kernel: u32,
+    stride: u32,
+    dilation: u32,
+    begin_padding: u32,
+    end_padding: u32,
+) -> Dimension {
+    let Dimension::Dynamic(dynamic) = input else {
+        return Dimension::Static(output_max);
+    };
+    let effective_kernel = dilation
+        .saturating_mul(kernel.saturating_sub(1))
+        .saturating_add(1);
+    if stride == 1
+        && begin_padding.saturating_add(end_padding).saturating_add(1) == effective_kernel
+    {
+        return Dimension::Dynamic(dynamic.clone());
+    }
+    Dimension::Dynamic(DynamicDimension {
+        name: format!(
+            "spatial({},k={kernel},s={stride},d={dilation},p={begin_padding}+{end_padding})",
+            dynamic.name
+        ),
+        max_size: output_max,
+    })
+}
+
 /// Infer output shape for 2D transposed convolution (deconvolution)
 ///
 /// Following the W3C WebNN specification for convTranspose2d:
@@ -873,45 +1016,33 @@ pub fn infer_pool2d_shape_dimensions(
         InputLayout::Nchw
     };
 
-    if let Some(sizes) = output_sizes
-        && sizes.len() >= 2
-    {
-        let oh = sizes[0];
-        let ow = sizes[1];
+    let [batch, input_first, input_second, input_third] = input_shape else {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!("Pool2d input must be 4D, got shape {input_shape:?}"),
+        });
+    };
+
+    if let Some([oh, ow, ..]) = output_sizes {
         let output_shape = match layout_enum {
             InputLayout::Nchw => vec![
-                input_shape[0].clone(),
-                input_shape[1].clone(),
-                Dimension::Static(oh),
-                Dimension::Static(ow),
+                batch.clone(),
+                input_first.clone(),
+                Dimension::Static(*oh),
+                Dimension::Static(*ow),
             ],
             InputLayout::Nhwc => vec![
-                input_shape[0].clone(),
-                Dimension::Static(oh),
-                Dimension::Static(ow),
-                input_shape[3].clone(),
+                batch.clone(),
+                Dimension::Static(*oh),
+                Dimension::Static(*ow),
+                input_third.clone(),
             ],
         };
         return Ok(output_shape);
     }
 
-    let strides_v: Vec<u32> = if strides.len() >= 2 {
-        vec![strides[0], strides[1]]
-    } else {
-        vec![1, 1]
-    };
-
-    let dilations_v: Vec<u32> = if dilations.len() >= 2 {
-        vec![dilations[0], dilations[1]]
-    } else {
-        vec![1, 1]
-    };
-
-    let pads_v: Vec<u32> = if padding.len() >= 4 {
-        vec![padding[0], padding[1], padding[2], padding[3]]
-    } else {
-        vec![0, 0, 0, 0]
-    };
+    let strides_v = spatial_pair(strides, [1, 1], "Pool2d strides")?;
+    let dilations_v = spatial_pair(dilations, [1, 1], "Pool2d dilations")?;
+    let pads_v = spatial_padding(padding, "Pool2d padding")?;
 
     let input_u32: Vec<u32> = input_shape.iter().map(get_static_or_max_size).collect();
     let pool_opts = MLPool2dOptions {
@@ -922,9 +1053,9 @@ pub fn infer_pool2d_shape_dimensions(
                 None
             }
         }),
-        padding: pads_v,
-        strides: strides_v,
-        dilations: dilations_v,
+        padding: pads_v.to_vec(),
+        strides: strides_v.to_vec(),
+        dilations: dilations_v.to_vec(),
         layout: layout.to_string(),
         output_shape_rounding: if ceil_output_spatial {
             "ceil".to_string()
@@ -934,7 +1065,66 @@ pub fn infer_pool2d_shape_dimensions(
         ..Default::default()
     };
     let out = infer_pool2d_shape(&input_u32, &pool_opts)?;
-    Ok(to_dimension_vector(&out))
+    let [_output_first, output_second, output_third, output_fourth] = out.as_slice() else {
+        return Err(GraphError::ShapeInferenceFailed {
+            reason: format!("Pool2d produced an invalid output shape {out:?}"),
+        });
+    };
+    let (input_h, input_w, output_h, output_w, channels, max_h, max_w) = match layout_enum {
+        InputLayout::Nchw => (
+            input_second,
+            input_third,
+            *output_third,
+            *output_fourth,
+            input_first,
+            get_static_or_max_size(input_second),
+            get_static_or_max_size(input_third),
+        ),
+        InputLayout::Nhwc => (
+            input_first,
+            input_second,
+            *output_second,
+            *output_third,
+            input_third,
+            get_static_or_max_size(input_first),
+            get_static_or_max_size(input_second),
+        ),
+    };
+    let windows = match pool_opts.window_dimensions.as_deref() {
+        Some([height, width]) => [*height, *width],
+        None => [max_h, max_w],
+        Some(invalid) => {
+            return Err(GraphError::ShapeInferenceFailed {
+                reason: format!("Pool2d window must contain two values, got {invalid:?}"),
+            });
+        }
+    };
+    let [window_h, window_w] = windows;
+    let [stride_h, stride_w] = strides_v;
+    let [dilation_h, dilation_w] = dilations_v;
+    let [pad_begin_h, pad_end_h, pad_begin_w, pad_end_w] = pads_v;
+    let height = infer_spatial_dimension(
+        input_h,
+        output_h,
+        window_h,
+        stride_h,
+        dilation_h,
+        pad_begin_h,
+        pad_end_h,
+    );
+    let width = infer_spatial_dimension(
+        input_w,
+        output_w,
+        window_w,
+        stride_w,
+        dilation_w,
+        pad_begin_w,
+        pad_end_w,
+    );
+    Ok(match layout_enum {
+        InputLayout::Nchw => vec![batch.clone(), channels.clone(), height, width],
+        InputLayout::Nhwc => vec![batch.clone(), height, width, channels.clone()],
+    })
 }
 
 /// Infer the output shape for global pooling operations
@@ -2529,7 +2719,7 @@ pub fn infer_split_shape(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Dimension, DynamicDimension};
+    use crate::graph::{Dimension, DynamicDimension, to_dimension_vector};
     use crate::operator_options::{MLConv2dOptions, MLConvTranspose2dOptions, MLPool2dOptions};
 
     fn d(name: &str, max_size: u32) -> Dimension {
@@ -2649,6 +2839,39 @@ mod tests {
         };
         let output = infer_conv2d_shape(&[1, 32, 32, 3], &[64, 3, 3, 3], &options).unwrap();
         assert_eq!(output, vec![1, 32, 32, 64]);
+    }
+
+    #[test]
+    fn test_conv2d_dimensions_preserve_dynamic_same_padding() -> Result<(), GraphError> {
+        let options = MLConv2dOptions {
+            strides: vec![1, 1],
+            dilations: vec![1, 1],
+            padding: vec![1, 1, 1, 1],
+            groups: 1,
+            input_layout: "nchw".to_string(),
+            filter_layout: "oihw".to_string(),
+            ..Default::default()
+        };
+        let output = infer_conv2d_shape_dimensions(
+            &[
+                Dimension::Static(1),
+                Dimension::Static(1),
+                Dimension::Static(105),
+                d("sequence_length", 4_096),
+            ],
+            &to_dimension_vector(&[20, 1, 3, 3]),
+            &options,
+        )?;
+        assert_eq!(
+            output,
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(20),
+                Dimension::Static(105),
+                d("sequence_length", 4_096),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
@@ -2915,6 +3138,35 @@ mod tests {
         // Output: (28 - 3) / 2 + 1 = 13
         let output = infer_pool2d_shape(&[1, 64, 28, 28], &options).unwrap();
         assert_eq!(output, vec![1, 64, 13, 13]);
+    }
+
+    #[test]
+    fn test_pool2d_dimensions_transform_dynamic_spatial_axis() -> Result<(), GraphError> {
+        let output = infer_pool2d_shape_dimensions(
+            &[
+                Dimension::Static(1),
+                Dimension::Static(20),
+                Dimension::Static(105),
+                d("sequence_length", 4_096),
+            ],
+            "nchw",
+            Some(&[2, 2]),
+            &[2, 2],
+            &[1, 1],
+            &[0, 0, 0, 0],
+            None,
+            false,
+        )?;
+        assert_eq!(
+            output,
+            vec![
+                Dimension::Static(1),
+                Dimension::Static(20),
+                Dimension::Static(52),
+                d("spatial(sequence_length,k=2,s=2,d=1,p=0+0)", 2_048),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
