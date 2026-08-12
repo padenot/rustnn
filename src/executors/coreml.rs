@@ -378,6 +378,17 @@ fn compute_unit_for_device(
     }
 }
 
+fn compute_unit_candidates(
+    device_type: crate::backend_selection::DeviceType,
+) -> Vec<CoremlComputeUnits> {
+    let preferred = compute_unit_for_device(device_type);
+    if preferred == CoremlComputeUnits::CpuOnly {
+        vec![preferred]
+    } else {
+        vec![preferred, CoremlComputeUnits::CpuOnly]
+    }
+}
+
 fn preferred_compute_units() -> [CoremlComputeUnits; 2] {
     [CoremlComputeUnits::All, CoremlComputeUnits::CpuOnly]
 }
@@ -392,7 +403,10 @@ fn benchmark_compute_units() -> [CoremlComputeUnits; 4] {
 }
 
 /// Load an ahead-of-time compiled `.mlmodelc` artifact without conversion or compilation.
-pub(crate) fn load_compiled_model(path: &Path) -> Result<CompiledCoremlModel, GraphError> {
+pub(crate) fn load_compiled_model(
+    path: &Path,
+    device_type: crate::backend_selection::DeviceType,
+) -> Result<CompiledCoremlModel, GraphError> {
     let canonical =
         std::fs::canonicalize(path).map_err(|error| GraphError::CoremlRuntimeFailed {
             reason: format!(
@@ -418,7 +432,7 @@ pub(crate) fn load_compiled_model(path: &Path) -> Result<CompiledCoremlModel, Gr
         let compiled_url = nsurl_from_path(&canonical)?;
         let compiled_url = RetainedObjcObject::new(msg_send![compiled_url, retain]);
         let mut last_error = String::from("MLModel load failed");
-        for compute_units in preferred_compute_units() {
+        for compute_units in compute_unit_candidates(device_type) {
             let config: *mut Object = msg_send![class!(MLModelConfiguration), new];
             let () = msg_send![config, setComputeUnits: compute_units.raw_value()];
             let mut model: *mut Object = ptr::null_mut();
@@ -465,11 +479,7 @@ pub(crate) fn compile_model(
         let (asset, specification_data, retained_weights_data) =
             create_in_memory_model_asset(model_bytes, weights_data)?;
 
-        let preferred = compute_unit_for_device(device_type);
-        let mut candidates = vec![preferred];
-        if preferred != CoremlComputeUnits::CpuOnly {
-            candidates.push(CoremlComputeUnits::CpuOnly);
-        }
+        let candidates = compute_unit_candidates(device_type);
 
         let mut last_error = String::from("MLModel load failed");
         for compute_units in candidates {
@@ -518,11 +528,7 @@ fn compile_model_from_url(
         let (compiled_url, compiled_dir, temp_model) =
             prepare_compiled_model_with_weights(model_bytes, weights_data, None)?;
         let compiled_url = RetainedObjcObject::new(compiled_url);
-        let preferred = compute_unit_for_device(device_type);
-        let mut candidates = vec![preferred];
-        if preferred != CoremlComputeUnits::CpuOnly {
-            candidates.push(CoremlComputeUnits::CpuOnly);
-        }
+        let candidates = compute_unit_candidates(device_type);
 
         let mut last_error = String::from("MLModel load failed");
         for compute_units in candidates {
@@ -2277,8 +2283,9 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod temp_model_tests {
     use super::{
         CompiledCoremlModel, CoremlComputeUnits, TempModelSource, benchmark_compute_units,
-        preferred_compute_units, write_temp_model_with_weights,
+        compute_unit_candidates, preferred_compute_units, write_temp_model_with_weights,
     };
+    use crate::backend_selection::DeviceType;
 
     #[test]
     fn compute_unit_values_match_coreml_framework() {
@@ -2298,6 +2305,25 @@ mod temp_model_tests {
         assert_eq!(
             preferred_compute_units(),
             [CoremlComputeUnits::All, CoremlComputeUnits::CpuOnly]
+        );
+    }
+
+    #[test]
+    fn requested_accelerator_is_first_with_only_cpu_fallback() {
+        assert_eq!(
+            compute_unit_candidates(DeviceType::Gpu),
+            [CoremlComputeUnits::CpuAndGpu, CoremlComputeUnits::CpuOnly,]
+        );
+        assert_eq!(
+            compute_unit_candidates(DeviceType::Npu),
+            [
+                CoremlComputeUnits::CpuAndNeuralEngine,
+                CoremlComputeUnits::CpuOnly,
+            ]
+        );
+        assert_eq!(
+            compute_unit_candidates(DeviceType::Cpu),
+            [CoremlComputeUnits::CpuOnly]
         );
     }
 

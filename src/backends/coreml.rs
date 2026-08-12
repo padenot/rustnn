@@ -69,7 +69,7 @@ impl fmt::Debug for CoremlBuilder {
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder {
     fn build(&mut self, graph_info: GraphInfo) -> crate::error::Result<MLGraph<'context>> {
         let model = if let Some(path) = &self.compiled_model_path {
-            load_compiled_model(path).map_err(|error| Error::GraphBuildError {
+            load_compiled_model(path, self.device_type).map_err(|error| Error::GraphBuildError {
                 source: error.into(),
             })?
         } else {
