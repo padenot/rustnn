@@ -139,10 +139,27 @@ pub fn run_coreml_zeroed_cached_with_runs(
     compiled_path: Option<&Path>,
     repetitions: usize,
 ) -> Result<Vec<CoremlRunAttempt>, GraphError> {
+    run_coreml_zeroed_cached_with_weights_and_runs(
+        model_bytes,
+        None,
+        inputs,
+        compiled_path,
+        repetitions,
+    )
+}
+
+/// Run repeated zero-input CoreML predictions with optional external weights.
+pub fn run_coreml_zeroed_cached_with_weights_and_runs(
+    model_bytes: &[u8],
+    weights_data: Option<&[u8]>,
+    inputs: &HashMap<String, OperandDescriptor>,
+    compiled_path: Option<&Path>,
+    repetitions: usize,
+) -> Result<Vec<CoremlRunAttempt>, GraphError> {
     autoreleasepool(|| {
         run_impl_zeroed_with_weights(
             model_bytes,
-            None,
+            weights_data,
             inputs,
             compiled_path,
             repetitions,
