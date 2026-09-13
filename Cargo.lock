@@ -3709,7 +3709,7 @@ dependencies = [
 [[package]]
 name = "webnn-graph"
 version = "0.3.0"
-source = "git+https://github.com/rustnn/webnn-graph?branch=main#075e3c2f8b78d67f5b0ffbc51d6bc81162397d43"
+source = "git+https://github.com/rustnn/webnn-graph?rev=075e3c2f8b78d67f5b0ffbc51d6bc81162397d43#075e3c2f8b78d67f5b0ffbc51d6bc81162397d43"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3726,7 +3726,7 @@ dependencies = [
 [[package]]
 name = "webnn-onnx-utils"
 version = "0.1.1"
-source = "git+https://github.com/rustnn/webnn-onnx-utils?branch=main#cead2ef3a35dded186617d0256614e2d5df463f7"
+source = "git+https://github.com/rustnn/webnn-onnx-utils?rev=cead2ef3a35dded186617d0256614e2d5df463f7#cead2ef3a35dded186617d0256614e2d5df463f7"
 dependencies = [
  "half",
  "once_cell",

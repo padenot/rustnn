@@ -65,8 +65,8 @@ litert = { version = "0.2.1", optional = true }
 litert-sys = { version = "0.2.1", optional = true }
 flatbuffers = { version = "25.12", optional = true }
 regex = "1.11"
-webnn-graph = { git = "https://github.com/rustnn/webnn-graph", branch = "main", default-features = false }
-webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", branch = "main", optional = true }
+webnn-graph = { git = "https://github.com/rustnn/webnn-graph", rev = "075e3c2f8b78d67f5b0ffbc51d6bc81162397d43", default-features = false }
+webnn-onnx-utils = { git = "https://github.com/rustnn/webnn-onnx-utils", rev = "cead2ef3a35dded186617d0256614e2d5df463f7", optional = true }
 
 cudarc = { version = "0.19", features = ["cuda-13020"], optional = true }
 log = "0.4.29"
