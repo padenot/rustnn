@@ -260,9 +260,6 @@ strum = { version = "0.28.0", features = ["derive"] }
 objc = { version = "0.2", optional = true, features = ["exception"] }
 
 [build-dependencies]
-# cleanup-markdown rewrites the .proto comments as Markdown and fences their code blocks as
-# text, so the generated docs keep Apple's comments without producing failing doctests.
-prost-build = { version = "0.12", features = ["cleanup-markdown"] }
 cc = "1.0"
 seahash = "4.1.0"
 
