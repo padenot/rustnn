@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn fixed_output_backing_proposals_follow_loaded_metadata() {
         use crate::backend_selection::DeviceType;
-        use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+        use crate::converters::{CoremlMlProgramConverter, GraphConverter, coreml_feature_name};
         use crate::graph::{GraphInfo, Operand, OperandKind};
         use crate::operators::Operation;
 
@@ -876,7 +876,7 @@ mod tests {
         let (eligible, dtype, constraint_type, shape_count, allowed) = autoreleasepool(|| unsafe {
             let model_description: *mut Object = msg_send![model.model, modelDescription];
             let descriptions: *mut Object = msg_send![model_description, outputDescriptionsByName];
-            let key = nsstring_from_str("result").unwrap();
+            let key = nsstring_from_str(&coreml_feature_name("result")).unwrap();
             let description: *mut Object = msg_send![descriptions, objectForKey: key];
             let constraint: *mut Object = msg_send![description, multiArrayConstraint];
             assert!(!constraint.is_null(), "result must have array metadata");
@@ -911,8 +911,8 @@ mod tests {
             };
             let result = run_coreml_tensors(
                 &model,
-                &HashMap::from([("input".into(), bind(&input))]),
-                &HashMap::from([("result".into(), bind(&output))]),
+                &HashMap::from([(coreml_feature_name("input"), bind(&input))]),
+                &HashMap::from([(coreml_feature_name("result"), bind(&output))]),
                 true,
                 &mut statistics,
             )

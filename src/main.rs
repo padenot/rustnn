@@ -151,9 +151,20 @@ fn run() -> Result<(), GraphError> {
                     format: converted.format.to_string(),
                 });
             }
+            // The model's feature names are derived from the WebNN names.
+            let inputs = artifacts
+                .input_names_to_descriptors
+                .iter()
+                .map(|(name, descriptor)| {
+                    (
+                        rustnn::converters::coreml_feature_name(name),
+                        descriptor.clone(),
+                    )
+                })
+                .collect();
             let attempts = rustnn::run_coreml_zeroed_cached(
                 &converted.data,
-                &artifacts.input_names_to_descriptors,
+                &inputs,
                 cli.coreml_compiled_output.as_deref(),
             )?;
             println!("Executed CoreML model with zeroed inputs:");

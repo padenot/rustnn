@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use rustnn::converters::{CoremlMlProgramConverter, GraphConverter};
+use rustnn::converters::{CoremlMlProgramConverter, GraphConverter, coreml_feature_name};
 use rustnn::executors::coreml::{
     CoremlInput, CoremlRunAttempt, run_coreml_with_inputs_checked, run_coreml_zeroed,
 };
@@ -81,12 +81,18 @@ fn check_convenience(
     let attempts = run_coreml_with_inputs_checked(
         &converted.data,
         vec![CoremlInput {
-            name: "input".into(),
+            name: coreml_feature_name("input"),
             shape: shape.iter().map(|&size| size as usize).collect(),
             data: values.to_vec(),
         }],
-        &HashMap::from([("input".into(), graph.operands[0].descriptor.clone())]),
-        &HashMap::from([("result".into(), graph.operands[1].descriptor.clone())]),
+        &HashMap::from([(
+            coreml_feature_name("input"),
+            graph.operands[0].descriptor.clone(),
+        )]),
+        &HashMap::from([(
+            coreml_feature_name("result"),
+            graph.operands[1].descriptor.clone(),
+        )]),
     )
     .unwrap();
     check_attempts(&attempts, expected);
@@ -230,7 +236,10 @@ fn coreml_dtypes_zeroed_inputs_use_native_allocation_width() {
         let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
         let attempts = run_coreml_zeroed(
             &converted.data,
-            &HashMap::from([("input".into(), graph.operands[0].descriptor.clone())]),
+            &HashMap::from([(
+                coreml_feature_name("input"),
+                graph.operands[0].descriptor.clone(),
+            )]),
         )
         .unwrap();
         check_attempts(&attempts, &[0.; 6]);

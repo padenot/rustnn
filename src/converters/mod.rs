@@ -40,6 +40,7 @@ pub mod webnn;
 mod weight_file_builder;
 
 pub use coreml_mlprogram::CoremlMlProgramConverter;
+pub use coreml_mlprogram::coreml_feature_name;
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;
 #[cfg(feature = "onnx")]
@@ -61,8 +62,9 @@ pub const ONNX_EXTERNAL_WEIGHTS_FILENAME: &str = "rustnn_external_weights.data";
 
 /// Get operand name for an operand ID, or generate a default name
 ///
-/// This is a shared helper used by all converters to ensure consistent
-/// operand naming across different backend formats.
+/// Shared by the converters whose formats accept arbitrary names. CoreML
+/// identifiers are restricted, see [`coreml_feature_name`].
+#[cfg(any(feature = "onnx", feature = "webnn-runtime"))]
 pub(crate) fn operand_name(graph: &GraphInfo, id: u32) -> String {
     graph
         .operand(id)
@@ -268,6 +270,7 @@ mod tests {
         registry.convert("Dummy", &graph).unwrap();
     }
 
+    #[cfg(any(feature = "onnx", feature = "webnn-runtime"))]
     #[test]
     fn test_operand_name_with_named_operand() {
         let graph = GraphInfo {
@@ -292,6 +295,7 @@ mod tests {
         assert_eq!(name, "input_tensor");
     }
 
+    #[cfg(any(feature = "onnx", feature = "webnn-runtime"))]
     #[test]
     fn test_operand_name_with_unnamed_operand() {
         let graph = GraphInfo {
@@ -316,6 +320,7 @@ mod tests {
         assert_eq!(name, "operand_0");
     }
 
+    #[cfg(any(feature = "onnx", feature = "webnn-runtime"))]
     #[test]
     fn test_operand_name_invalid_id() {
         let graph = GraphInfo {

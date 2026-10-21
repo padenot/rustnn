@@ -25,7 +25,6 @@
 /// - Better optimization
 ///
 /// This replaces the legacy NeuralNetwork format.
-use crate::converters::operand_name;
 use crate::error::GraphError;
 use crate::graph::{DataType, Dimension as GraphDimension, GraphInfo, OperandKind};
 use crate::operator_enums::{MLOperandDataType, MLPaddingMode};
@@ -260,6 +259,43 @@ mod mil_ops {
 
 // Default epsilon value used by several CoreML operations for numerical stability.
 const DEFAULT_EPSILON: f32 = 1e-45;
+
+/// MIL identifier for a WebNN graph input or output name.
+///
+/// MIL value names must be identifiers (`[A-Za-z_][A-Za-z0-9_]*`) that are not
+/// reserved words of the MIL text format (`tensor`, `state`, `func`, data type
+/// names such as `fp32`, `true`, `nan`, ...), and the model's input and output
+/// feature names must equal the function's input and output value names, so
+/// WebNN names cannot be used verbatim. They become `_x` followed by the name
+/// with every character outside `[A-Za-z0-9]` written as `_<hex code point>_`.
+/// This is injective, never a reserved word, and disjoint from the `_v<id>`
+/// names given to all other operands.
+pub fn coreml_feature_name(name: &str) -> String {
+    let mut escaped = String::from("_x");
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            escaped.push(c);
+        } else {
+            escaped.push_str(&format!("_{:x}_", c as u32));
+        }
+    }
+    escaped
+}
+
+/// MIL value name for an operand.
+///
+/// Graph inputs and outputs are named after their WebNN name (see
+/// [`coreml_feature_name`]). Every other operand gets a name derived from its
+/// id only: operator labels are free-form and need not be unique.
+fn operand_name(graph: &GraphInfo, id: u32) -> String {
+    if let Some(operand) = graph.operand(id)
+        && matches!(operand.kind, OperandKind::Input | OperandKind::Output)
+        && let Some(name) = &operand.name
+    {
+        return coreml_feature_name(name);
+    }
+    format!("_v{id}")
+}
 
 /// Converts a graph to a CoreML MLProgram (MIL) model.
 #[derive(Default)]
@@ -10718,7 +10754,7 @@ mod tests {
                 let select = block.operations.last().unwrap();
                 assert_eq!(
                     select.inputs["a"],
-                    CoremlMlProgramConverter::create_argument("input")
+                    CoremlMlProgramConverter::create_argument(&coreml_feature_name("input"))
                 );
                 let zero = match dtype {
                     DataType::Float16 => CoremlMlProgramConverter::create_immediate_float16(0.0),
@@ -10727,7 +10763,7 @@ mod tests {
                 assert_eq!(select.inputs["b"], zero);
                 assert_eq!(
                     block.operations[0].inputs["ref_tensor"],
-                    CoremlMlProgramConverter::create_argument("input")
+                    CoremlMlProgramConverter::create_argument(&coreml_feature_name("input"))
                 );
             }
         }
@@ -11916,7 +11952,7 @@ mod tests {
         else {
             panic!("select condition should be a named bool value");
         };
-        assert_eq!(condition_name, "condition_bool_3");
+        assert_eq!(condition_name, "_v0_bool_3");
 
         #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
         {
@@ -11934,25 +11970,27 @@ mod tests {
             let when_false = [30.0f32, 40.0];
             let inputs = HashMap::from([
                 (
-                    "when_true".to_string(),
+                    coreml_feature_name("when_true"),
                     CoremlByteInput {
                         descriptor: &graph.operands[1].descriptor,
                         data: bytemuck::cast_slice(&when_true),
                     },
                 ),
                 (
-                    "when_false".to_string(),
+                    coreml_feature_name("when_false"),
                     CoremlByteInput {
                         descriptor: &graph.operands[2].descriptor,
                         data: bytemuck::cast_slice(&when_false),
                     },
                 ),
             ]);
-            let outputs =
-                HashMap::from([("result".to_string(), graph.operands[3].descriptor.clone())]);
+            let outputs = HashMap::from([(
+                coreml_feature_name("result"),
+                graph.operands[3].descriptor.clone(),
+            )]);
             let actual = run_coreml_bytes(&model, &inputs, &outputs).unwrap();
             assert_eq!(
-                actual["result"],
+                actual[&coreml_feature_name("result")],
                 bytemuck::cast_slice::<f32, u8>(&[30.0f32, 20.0])
             );
         }
@@ -12207,7 +12245,7 @@ mod tests {
                 let indices = description
                     .input
                     .iter()
-                    .find(|feature| feature.name == "indices")
+                    .find(|feature| feature.name == coreml_feature_name("indices"))
                     .unwrap();
                 assert_eq!(model_array_feature_type(indices).shape, [1]);
             }
@@ -12277,7 +12315,7 @@ mod tests {
                 assert_eq!(tensor.data_type, expected_dtype as i32);
                 assert_eq!(immediate_int_argument(&gather.inputs["axis"]), axis);
                 let output = block.operations.last().unwrap();
-                assert_eq!(output.outputs[0].name, "result");
+                assert_eq!(output.outputs[0].name, coreml_feature_name("result"));
                 assert_eq!(
                     mil_tensor_type(&output.outputs[0]).dimensions.len(),
                     output_shape.len().max(1)

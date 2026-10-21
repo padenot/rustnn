@@ -15,7 +15,7 @@ use log::debug;
 
 use crate::GraphInfo;
 use crate::backend_selection::DeviceType;
-use crate::converters::{CoremlMlProgramConverter, GraphConverter};
+use crate::converters::{CoremlMlProgramConverter, GraphConverter, coreml_feature_name};
 use crate::error::Error;
 use crate::executors::coreml::{
     CompiledCoremlModel, CoremlByteInput, CoremlTensorBinding, CoremlTensorStorage, compile_model,
@@ -222,6 +222,7 @@ impl CoremlContext {
         };
         let input_descriptors = active(&graph.input_descriptors, inputs)?;
         let output_descriptors = active(&graph.output_descriptors, outputs)?;
+        // Bindings are keyed by CoreML feature name, not WebNN name.
         fn bind<'a>(
             descriptors: &'a HashMap<String, crate::graph::OperandDescriptor>,
             tensors: &MLNamedTensors,
@@ -231,7 +232,7 @@ impl CoremlContext {
                 .iter()
                 .map(|(name, descriptor)| {
                     (
-                        name.clone(),
+                        coreml_feature_name(name),
                         CoremlTensorBinding {
                             storage: &storage[tensors[name.as_str()].id].storage,
                             descriptor,
@@ -418,7 +419,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                     logical
                 );
                 byte_inputs.insert(
-                    name.clone(),
+                    coreml_feature_name(name),
                     CoremlByteInput {
                         data: bytes,
                         descriptor,
@@ -431,9 +432,13 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
                 .values()
                 .map(|i| i.data.len() as u64)
                 .sum::<u64>();
-            let result =
-                run_coreml_bytes(&coreml_graph.model, &byte_inputs, &graph.output_descriptors)
-                    .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+            let output_descriptors = graph
+                .output_descriptors
+                .iter()
+                .map(|(name, descriptor)| (coreml_feature_name(name), descriptor.clone()))
+                .collect();
+            let result = run_coreml_bytes(&coreml_graph.model, &byte_inputs, &output_descriptors)
+                .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
             self.statistics.output_copy_bytes +=
                 result.values().map(|b| b.len() as u64).sum::<u64>();
             result
@@ -443,11 +448,12 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
             if self.tensors[ml_tensor.id].storage.is_native() {
                 continue;
             }
-            let data = out_bytes
-                .get(name)
-                .ok_or_else(|| Error::GraphDispatchError {
+            // Outputs come back keyed by CoreML feature name.
+            let data = out_bytes.get(&coreml_feature_name(name)).ok_or_else(|| {
+                Error::GraphDispatchError {
                     source: format!("model did not produce output '{name}'").into(),
-                })?;
+                }
+            })?;
             let logical = tensor_byte_len(ml_tensor.descriptor());
 
             // The executor converts to the graph's declared WebNN dtype,
@@ -574,6 +580,7 @@ mod test {
     };
     use crate::mlgraphbuilder::MLGraphBuilder;
     use crate::operator_enums::MLOperandDataType;
+    use crate::operator_options::MLOperatorOptions;
 
     /// Build a context backed by CoreML. Returns `None` (test skipped) if no
     /// accelerated backend is available on this machine.
@@ -1175,6 +1182,112 @@ mod test {
             let mut result = vec![0.0f32; 4];
             context.read_tensor(&out, &mut result).unwrap();
             assert_eq!(result, &[11.0f32, 22., 33., 44.]);
+        }
+    }
+
+    /// Build `(a + b) <op> b` with the given I/O names and operator label, run it
+    /// through both dispatch paths and check the result. CoreML MIL identifiers
+    /// are restricted, so names and labels must not leak into the program as-is.
+    fn check_named_graph(input_names: [&str; 2], output_name: &str, label: &str, matmul: bool) {
+        let _ = pretty_env_logger::try_init();
+        for reuse in [false, true] {
+            let mut options = crate::mlcontextoptions::RustNNOptions::default();
+            options.coreml.reuse_tensor_storage = reuse;
+            let context = MLContext::create(
+                &MLContextOptions::new(MLPowerPreference::Default, true)
+                    .with_rustnn_backend_hint(Backend::Coreml)
+                    .with_rustnn_options(options),
+            );
+            let mut context = match context {
+                Ok(ctx) => ctx,
+                Err(crate::error::Error::NoBackendAvailableForBackendHint { .. }) => return,
+                Err(e) => panic!("unexpected context creation error: {e:?}"),
+            };
+
+            let desc = MLOperandDescriptor::new(MLOperandDataType::Float32, [2, 2].to_vec());
+            let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+            let a = builder.input(input_names[0], &desc).unwrap();
+            let b = builder.input(input_names[1], &desc).unwrap();
+            let opts = || MLOperatorOptions {
+                label: label.to_string(),
+            };
+            // Two operations sharing the same label.
+            let sum = builder.add_with_options(a, b, opts()).unwrap();
+            let output = if matmul {
+                builder.matmul_with_options(sum, b, opts()).unwrap()
+            } else {
+                builder.mul_with_options(sum, b, opts()).unwrap()
+            };
+            let mut outputs = MLNamedOperands::new();
+            outputs.insert(output_name, output);
+            let mut graph = builder.build(&outputs).unwrap();
+
+            let mut io_desc = MLTensorDescriptor::from_operand_descriptor(&desc);
+            io_desc.set_writable(true);
+            io_desc.set_readable(true);
+            let a = context.create_tensor(&io_desc).unwrap();
+            let b = context.create_tensor(&io_desc).unwrap();
+            let out = context.create_tensor(&io_desc).unwrap();
+            context.write_tensor(&a, &[1.0f32, 2., 3., 4.]).unwrap();
+            context.write_tensor(&b, &[1.0f32, 0., 0., 1.]).unwrap();
+
+            let mut inputs = MLNamedTensors::new();
+            inputs.insert(input_names[0], &a);
+            inputs.insert(input_names[1], &b);
+            let mut out_bindings = MLNamedTensors::new();
+            out_bindings.insert(output_name, &out);
+            context
+                .dispatch(&mut graph, &inputs, &out_bindings)
+                .unwrap();
+
+            // a + b = [2, 2, 3, 5]; times identity b is unchanged either way
+            // for matmul, elementwise mul keeps only the diagonal.
+            let expected: &[f32] = if matmul {
+                &[2., 2., 3., 5.]
+            } else {
+                &[2., 0., 0., 5.]
+            };
+            let mut result = vec![0.0f32; 4];
+            context.read_tensor(&out, &mut result).unwrap();
+            assert_eq!(result, expected, "reuse_tensor_storage={reuse}");
+        }
+    }
+
+    #[test]
+    fn coreml_onnx_style_labels() {
+        check_named_graph(
+            ["sample", "timestep"],
+            "out_sample",
+            "/text_encoder/text_model/encoder/layers.0/self_attn/q_proj/MatMul",
+            true,
+        );
+    }
+
+    #[test]
+    fn coreml_special_character_names() {
+        for (inputs, output, label) in [
+            (["12-L#!.☺", "🤦🏼‍♂️124DS#!F"], "output", "12-L#!.☺"),
+            (["\0node_a", "node\0b"], "\0", "\0"),
+            (
+                ["hello\n\t'\"\\webnn", "\u{a9}\u{2665}\u{2026}"],
+                "😀",
+                "🤦🏼‍♂️124DS#!F",
+            ),
+            (["x y", "1abc"], "a.b", ""),
+            (["sample/0", "sample_0"], "sample.0", "sample-0"),
+        ] {
+            check_named_graph(inputs, output, label, false);
+        }
+    }
+
+    #[test]
+    fn coreml_names_colliding_with_internal_names() {
+        for (inputs, output) in [
+            (["operand_0", "operand_1"], "operand_2"),
+            (["a", "a_graph"], "operand_3"),
+            (["main", "tensor"], "fp32"),
+        ] {
+            check_named_graph(inputs, output, "operand_2", false);
         }
     }
 }
