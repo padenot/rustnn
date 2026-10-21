@@ -9,6 +9,7 @@ This changelog consolidates the previous `RELEASE_NOTES_*.md` files into a singl
 ### Added
 
 ### Changed
+- `clap` and `tracing-subscriber` are now optional, behind a new default `cli` feature that also gates the `rustnn` binary; build with `default-features = false` to use the library without them.
 
 ### Fixed
 

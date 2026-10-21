@@ -33,6 +33,9 @@ The default build needs no native runtime beyond the prerequisites above.
 The mock backend features and `dynamic-inputs`, `native-examples`, `pollster`, and
 `zstd-cache-compression` do not add external runtime prerequisites.
 
+The default `cli` feature builds the `rustnn` binary and pulls in `clap` and
+`tracing-subscriber`. Library consumers can drop both with `default-features = false`.
+
 ## Build and test
 
 Use the Makefile targets; they set feature flags and environment variables consistently.
