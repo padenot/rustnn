@@ -1,7 +1,7 @@
 //! Converters from [`GraphInfo`] to backend-specific model formats.
 //!
 //! Each backend in [`crate::backends`] converts the graph with the matching converter when
-//! a graph is built: ONNX protobuf ([`OnnxConverter`]), CoreML MLProgram
+//! a graph is built: ONNX protobuf (`OnnxConverter`), CoreML MLProgram
 //! ([`CoremlMlProgramConverter`]), a native TensorRT network (`TrtxConverter`), a TFLite
 //! flatbuffer (`LiteRtConverter`) or a CANN offline model (`CannConverter`). The
 //! [`ConverterRegistry`] exposes the same converters by format name for the CLI and for the
@@ -17,7 +17,13 @@ use crate::graph::GraphInfo;
 mod coreml_mlprogram;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
+#[cfg(feature = "onnx")]
 pub mod onnx;
+#[cfg(any(
+    feature = "onnx",
+    feature = "trtx-runtime-mock",
+    feature = "trtx-runtime"
+))]
 mod pool2d_shared;
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 mod trtx;
@@ -36,6 +42,7 @@ mod weight_file_builder;
 pub use coreml_mlprogram::CoremlMlProgramConverter;
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;
+#[cfg(feature = "onnx")]
 pub use onnx::OnnxConverter;
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 pub use trtx::TrtxConverter;
@@ -95,6 +102,7 @@ impl ConverterRegistry {
         let mut registry = Self {
             converters: HashMap::new(),
         };
+        #[cfg(feature = "onnx")]
         registry.register(Box::new(OnnxConverter));
         registry.register(Box::new(CoremlMlProgramConverter));
         #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
@@ -193,10 +201,9 @@ mod tests {
         let registry = ConverterRegistry::with_defaults();
         let formats = registry.available_formats();
 
-        // Should have at least ONNX and CoreML converters
+        #[cfg(feature = "onnx")]
         assert!(formats.contains(&"onnx"));
         assert!(formats.contains(&"coreml"));
-        assert!(formats.len() >= 2);
     }
 
     #[test]
