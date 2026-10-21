@@ -741,6 +741,23 @@ pub extern "C" fn rustnn_last_error_message() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ptr())
 }
 
+/// Set the directory where backends write temporary files. A null `path` restores the system
+/// temporary directory. See [crate::temp_dir].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rustnn_set_temp_directory(path: *const c_char) -> RustnnStatus {
+    if path.is_null() {
+        crate::temp_dir::set_temp_dir(None);
+        return RustnnStatus::Success;
+    }
+    match unsafe { input_str(path, "path") } {
+        Ok(path) => {
+            crate::temp_dir::set_temp_dir(Some(path.into()));
+            RustnnStatus::Success
+        }
+        Err(status) => status,
+    }
+}
+
 /// Install rustnn's `pretty_env_logger` global logger if no logger is installed yet.
 ///
 /// Set `RUST_LOG` before calling this function. Repeated calls are safe; calls made after another

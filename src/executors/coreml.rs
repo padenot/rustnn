@@ -2182,7 +2182,7 @@ fn write_temp_model_with_weights(
         let package = tempfile::Builder::new()
             .prefix("rustnn_coreml_")
             .suffix(".mlpackage")
-            .tempdir()
+            .tempdir_in(crate::temp_dir::temp_dir())
             .map_err(map_io)?;
         let package_path = package.path();
         let data_dir = package_path.join("Data").join("com.apple.CoreML");
@@ -2239,7 +2239,7 @@ fn write_temp_model_with_weights(
         let mut file = tempfile::Builder::new()
             .prefix("rustnn_coreml_")
             .suffix(".mlmodel")
-            .tempfile()
+            .tempfile_in(crate::temp_dir::temp_dir())
             .map_err(map_io)?;
         file.write_all(model_bytes).map_err(map_io)?;
         file.flush().map_err(map_io)?;

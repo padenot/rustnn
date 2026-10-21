@@ -139,6 +139,7 @@ pub mod operators;
 pub mod protos;
 pub mod runtime_checks;
 pub mod shape_inference;
+pub mod temp_dir;
 pub mod tensor;
 pub mod validator;
 pub mod webnn_json;
