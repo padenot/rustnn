@@ -5,7 +5,7 @@
 | Tool | Notes |
 |---|---|
 | Rust | `rust-toolchain.toml` pins the channel (1.97.0 at the time of writing) with `rustfmt` and `clippy`; rustup installs it on first use. The CI workflows pin the same version, so bump them together |
-| `protoc` | Required: `build.rs` compiles the ONNX and CoreML protobuf schemas. Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
+| `protoc` | Required: `build.rs` compiles the CoreML protobuf schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature). Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
 | `flatc` | Required for `litert-runtime` (TFLite schema). CI downloads the flatbuffers release binary; macOS `brew install flatbuffers` |
 | Node.js | WPT corpus fetch and evaluation (`scripts/fetch_wpt.mjs`, `scripts/wpt_bridge/`) |
 | Python 3 | Only for MkDocs (`pip install -r docs/requirements.txt`) and `scripts/generate_backend_operator_report.py` |

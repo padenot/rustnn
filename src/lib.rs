@@ -77,11 +77,12 @@
 //! # Cargo features
 //!
 //! Backends are opt-in. Without a runtime feature the crate still validates graphs and
-//! converts them to ONNX and CoreML protobufs, but [`mlcontext::MLContext::create`] fails
+//! converts them to CoreML protobufs (and ONNX with the default `onnx` feature), but [`mlcontext::MLContext::create`] fails
 //! with [`error::Error::NoBackendAvailable`].
 //!
 //! | Feature | Effect |
 //! |---|---|
+//! | `onnx` | ONNX converter and `protos::onnx` (default; enabled by `onnx-runtime`). Without it, `webnn-onnx-utils` is not built |
 //! | `onnx-runtime` | ONNX Runtime backend through the `ort` crate (dynamic loading, `ORT_DYLIB_PATH`) |
 //! | `trtx-runtime` | NVIDIA TensorRT-RTX backend through the `trtx` crate; `trtx-runtime-mock` builds without a GPU |
 //! | `trtx-enterprise` | `trtx-runtime` linked against full TensorRT 10 (`nvinfer`) instead of TensorRT-RTX; RTX-only features are compiled out (validation only) |
