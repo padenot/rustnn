@@ -15,6 +15,7 @@ use crate::error::GraphError;
 use crate::graph::GraphInfo;
 
 mod coreml_mlprogram;
+pub(crate) mod coreml_names;
 #[cfg(feature = "litert-runtime")]
 pub mod litert;
 #[cfg(feature = "onnx")]
@@ -39,7 +40,22 @@ mod trtx_rnn;
 pub mod webnn;
 mod weight_file_builder;
 
+#[cfg(all(
+    feature = "coreml-runtime",
+    any(target_os = "macos", target_os = "ios", test)
+))]
+pub(crate) use coreml_mlprogram::CoremlConstantCopies;
 pub use coreml_mlprogram::CoremlMlProgramConverter;
+#[cfg(feature = "coreml-runtime")]
+pub(crate) use coreml_mlprogram::CoremlPassthrough;
+#[cfg(all(
+    feature = "coreml-runtime",
+    any(target_os = "macos", target_os = "ios")
+))]
+pub(crate) use coreml_mlprogram::{
+    INPUT_ALIASES_METADATA_KEY, OUTPUT_ALIASES_METADATA_KEY, OUTPUT_CONSTANT_COPIES_METADATA_KEY,
+    OUTPUT_PASSTHROUGHS_METADATA_KEY,
+};
 #[cfg(feature = "litert-runtime")]
 pub use litert::LiteRtConverter;
 #[cfg(feature = "onnx")]
@@ -47,6 +63,11 @@ pub use onnx::OnnxConverter;
 #[cfg(any(feature = "trtx-runtime-mock", feature = "trtx-runtime"))]
 pub use trtx::TrtxConverter;
 pub(crate) use weight_file_builder::WeightFileBuilder;
+#[cfg(all(
+    feature = "coreml-runtime",
+    any(target_os = "macos", target_os = "ios", test)
+))]
+pub(crate) use weight_file_builder::weight_ranges;
 
 #[cfg(any(feature = "cann-runtime", feature = "cann-runtime-mock"))]
 pub mod cann;
@@ -187,7 +208,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -226,7 +246,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -258,7 +277,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -284,7 +302,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -308,7 +325,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -324,7 +340,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 
@@ -362,7 +377,6 @@ mod tests {
             output_operands: vec![],
             operations: vec![],
             constant_operand_ids_to_handles: Default::default(),
-            id_to_constant_tensor_operand_map: Default::default(),
             quantized: false,
         };
 

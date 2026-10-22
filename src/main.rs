@@ -151,8 +151,9 @@ fn run() -> Result<(), GraphError> {
                     format: converted.format.to_string(),
                 });
             }
-            let attempts = rustnn::run_coreml_zeroed_cached(
+            let attempts = rustnn::coreml::run_coreml_zeroed_cached_with_weights(
                 &converted.data,
+                converted.weights_data.as_deref(),
                 &artifacts.input_names_to_descriptors,
                 cli.coreml_compiled_output.as_deref(),
             )?;
