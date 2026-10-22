@@ -29,7 +29,7 @@ runtime (compiling, transposing runtime tensors, refitting weights) belongs to
 
 | Converter | File | Output | Registered when |
 |---|---|---|---|
-| `OnnxConverter` | `onnx.rs` | ONNX `ModelProto` (prost) | always |
+| `OnnxConverter` | `onnx.rs` | ONNX `ModelProto` (prost) | `onnx` (default), `onnx-runtime` |
 | `CoremlMlProgramConverter` | `coreml_mlprogram.rs` | CoreML MLProgram (`protos::coreml`) | always |
 | `TrtxConverter` | `trtx.rs`, `trtx_gru.rs`, `trtx_lstm.rs`, `trtx_rnn.rs` | TensorRT network built through the `trtx` crate, serialized engine | `trtx-runtime`, `trtx-runtime-mock` |
 | `LiteRtConverter` | `litert.rs` | TFLite flatbuffer (`flatc`-generated schema) | `litert-runtime` |

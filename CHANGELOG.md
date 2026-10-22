@@ -10,6 +10,7 @@ This changelog consolidates the previous `RELEASE_NOTES_*.md` files into a singl
 
 ### Changed
 - `clap` and `tracing-subscriber` are now optional, behind a new default `cli` feature that also gates the `rustnn` binary; build with `default-features = false` to use the library without them.
+- The ONNX converter, `protos::onnx` and the `webnn-onnx-utils` dependency are behind a new default `onnx` feature (implied by `onnx-runtime`); `webnn-graph` is used without its `onnx` feature. Builds with `default-features = false` and a non-ONNX backend no longer compile the ONNX schema.
 
 ### Fixed
 

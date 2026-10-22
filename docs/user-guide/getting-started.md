@@ -8,7 +8,7 @@ then shows how to load graphs from files and how to use the command line tool.
 | Requirement | Needed for |
 |---|---|
 | Rust 1.97 or newer (edition 2024); `rust-toolchain.toml` pins it for the repository itself | the crate |
-| `protoc`, the Protocol Buffers compiler, on `PATH` | `build.rs` compiles the ONNX and CoreML schemas |
+| `protoc`, the Protocol Buffers compiler, on `PATH` | `build.rs` compiles the CoreML schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature) |
 | `flatc` | the `litert-runtime` feature only (TFLite schema) |
 | Node.js | the WPT conformance tests only |
 | A backend library | execution; see [Backends](https://rustnn.github.io/rustnn/api/rustnn/backend_selection/). The ONNX Runtime shared library works on every platform and is the usual starting point |
