@@ -1266,12 +1266,12 @@ mod test {
     #[test]
     fn coreml_special_character_names() {
         for (inputs, output, label) in [
-            (["12-L#!.☺", "🤦🏼‍♂️124DS#!F"], "output", "12-L#!.☺"),
+            (["12-L#!.☺", "🤦🏼\u{200d}♂️124DS#!F"], "output", "12-L#!.☺"),
             (["\0node_a", "node\0b"], "\0", "\0"),
             (
                 ["hello\n\t'\"\\webnn", "\u{a9}\u{2665}\u{2026}"],
                 "😀",
-                "🤦🏼‍♂️124DS#!F",
+                "🤦🏼\u{200d}♂️124DS#!F",
             ),
             (["x y", "1abc"], "a.b", ""),
             (["sample/0", "sample_0"], "sample.0", "sample-0"),
