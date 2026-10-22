@@ -12,6 +12,7 @@ const NAMES: &[(&str, &str)] = &[
     ("cache.key", "next.key"),
     ("cache-key", "next-key"),
     ("缓存", "结果"),
+    ("🤦🏼\u{200d}♂️", "unicode_result"),
     ("rustnn_escaped_7374617465", "rustnn_escaped_74656e736f72"),
     ("state_workaround", "tensor_workaround"),
 ];
