@@ -813,6 +813,7 @@ mod runtime {
         assert_outputs(&attempts, &[("y", &[1.5, -2.5]), ("out", &[1.5, -2.5])]);
     }
 
+    #[cfg(feature = "cli")]
     #[test]
     fn cli_run_coreml_executes_constant_copy_outputs() {
         for (text, shape) in [(IMMEDIATE_CONSTANT_COPY, 4), (BLOB_CONSTANT_COPY, 2)] {

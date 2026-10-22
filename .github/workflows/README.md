@@ -22,7 +22,9 @@
   `make test-coreml-tensor-reuse` also runs in both configurations to check retained
   storage ownership, conversion, aliasing and resizing.
   It also builds and tests CoreML with and without dynamic inputs using `make build-coreml`
-  and `make test-coreml`. `make test-coreml-gather` also runs the focused gather bounds and
+  and `make test-coreml`; both explicitly enable `cli` so CLI integration tests build and
+  execute the CoreML binary. CLI tests are excluded when `cli` is disabled.
+  `make test-coreml-gather` also runs the focused gather bounds and
   scalar-index shape regressions; numerical checks remain strict.
 - The documentation site combines three generated parts: MkDocs pages from `docs/`, rustdoc from
   `make docs-api`, and the WPT dashboard cached by the nightly workflow. Test a docs change

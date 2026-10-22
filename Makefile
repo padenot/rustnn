@@ -217,12 +217,12 @@ test-coreml-tensor-reuse:
 
 # Build every target, including examples and the separately run WPT harness.
 build-coreml:
-	$(CARGO) build --all-targets --no-default-features --features $(COREML_FEATURES)
+	$(CARGO) build --all-targets --no-default-features --features cli,$(COREML_FEATURES)
 
 # Ordinary integration suites use test_*. The live WPT and browser harnesses
 # have their own targets and corpus/device setup; do not run them here.
 test-coreml:
-	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features $(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
+	$(CARGO) test --lib --bins --test 'test_*' --no-default-features --features cli,$(COREML_FEATURES) -- $(TEST_FILTER) --test-threads=1
 
 # Defaults to self-contained attention/cache chaining with an independent oracle.
 benchmark-coreml-kv:
