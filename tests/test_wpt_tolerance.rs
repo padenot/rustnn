@@ -859,16 +859,20 @@ fn strict_comparator_matches_upstream_javascript_intermediate_budgets() {
     )
     .unwrap();
     assert_eq!(source.value, 18);
-    // This source callback omits an int32 budget. Do not substitute the
-    // float32 allowance, compatibility default, or an invented exact budget.
-    let error = wpt_js_loader::resolve_source_tolerance(
-        "div.https.any.js",
-        "div int32 4D tensors",
-        &json!({}),
-    )
-    .unwrap_err();
-    assert!(
-        error.contains("Upstream tolerance callback returned no finite budget"),
-        "{error}"
-    );
+    for (file, name) in [
+        ("div.https.any.js", "div int32 4D tensors"),
+        (
+            "qdq_subgraph.https.any.js",
+            "per-channel quantized gemm with non-zero quantized dimension of the filter",
+        ),
+    ] {
+        let source = wpt_js_loader::resolve_source_tolerance(
+            file,
+            name,
+            &json!({"dequantizedInputA": {"shape": [2, 2], "dataType": "float32"}}),
+        )
+        .unwrap();
+        assert_eq!(source.metric_type, "ULP");
+        assert_eq!(source.value, 0);
+    }
 }

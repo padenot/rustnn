@@ -145,8 +145,9 @@ WPT_COREML_DEVICE=gpu WPT_COREML_TENSOR_MODE=backings \
 Add `WPT_STRICT_TOLERANCE=1` to use the upstream case's tolerance without local
 ULP minima, absolute-error floors, or CANN's FP16 allowance. This opt-in mode
 preserves the historical default while exposing numerical conformance gaps.
-A missing or malformed source tolerance fails explicitly rather than selecting
-a local default. Strict mode accepts upstream ULP and ATOL, not the local RTOL
+A missing or malformed floating-point source tolerance fails explicitly rather than
+selecting a local default. An integer-only output with a missing ULP budget must
+match exactly, following WPT's equality shortcut. Strict mode accepts upstream ULP and ATOL, not the local RTOL
 extension. Keep strict and compatibility results separate when reporting passes.
 The compatibility ATOL/RTOL and ULP comparators retain their existing behavior;
 the stronger nonfinite gate and full-width ULP budgets apply only to strict mode.
