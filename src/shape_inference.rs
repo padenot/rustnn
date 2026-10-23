@@ -2184,23 +2184,44 @@ pub fn infer_resample2d_shape(
         [1.0, 1.0]
     };
 
+    let scaled_size = |size: u32, scale: f32| -> Result<u32, GraphError> {
+        let invalid = || GraphError::ShapeInferenceFailed {
+            reason: "Resample2d scaled dimension is outside 1..=i32::MAX".into(),
+        };
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(invalid());
+        }
+        // Multiply the exact binary32 significand before truncating the size.
+        let bits = scale.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32;
+        let significand = (bits & 0x7fffff) | if exponent == 0 { 0 } else { 0x800000 };
+        let exponent = if exponent == 0 { -149 } else { exponent - 150 };
+        let product = u64::from(size) * u64::from(significand);
+        let scaled = if exponent >= 0 {
+            if exponent >= 31 || product > (i32::MAX as u64 >> exponent) {
+                return Err(invalid());
+            }
+            product << exponent
+        } else {
+            product.checked_shr((-exponent) as u32).unwrap_or(0)
+        };
+        if scaled == 0 || scaled > i32::MAX as u64 {
+            return Err(invalid());
+        }
+        Ok(scaled as u32)
+    };
+
     for (axis_idx, scale) in scale_pair.iter().enumerate() {
         let axis = axes[axis_idx];
         output[axis] = match &input_shape[axis] {
-            Dimension::Static(in_dim) => Dimension::Static(
-                (f64::from((*in_dim).max(1)) * f64::from(*scale))
-                    .floor()
-                    .max(1.0) as u32,
-            ),
+            Dimension::Static(in_dim) => Dimension::Static(scaled_size(*in_dim, *scale)?),
             Dimension::Dynamic(d) => {
-                if (*scale - 1.0).abs() < f32::EPSILON {
+                if *scale == 1.0 {
                     Dimension::Dynamic(d.clone())
                 } else {
                     Dimension::Dynamic(DynamicDimension {
                         name: d.name.clone(),
-                        max_size: (f64::from(d.max_size.max(1)) * f64::from(*scale))
-                            .floor()
-                            .max(1.0) as u32,
+                        max_size: scaled_size(d.max_size, *scale)?,
                     })
                 }
             }
@@ -3791,6 +3812,17 @@ mod tests {
 
         let out = infer_resample2d_shape(&input, [2, 3], None, &[]).unwrap();
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn resample_scaled_shape_floors_without_float32_dimension_rounding() {
+        for (size, scale, expected) in [(16777217, 1.0, 16777217), (3, 1.5, 4), (4, 0.75, 3)] {
+            let input = vec![Dimension::Static(1), Dimension::Static(size)];
+            assert_eq!(
+                infer_resample2d_shape(&input, [0, 1], None, &[1.0, scale]).unwrap(),
+                vec![Dimension::Static(1), Dimension::Static(expected)]
+            );
+        }
     }
 
     // ScatterND tests

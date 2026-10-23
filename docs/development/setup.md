@@ -5,7 +5,7 @@
 | Tool | Notes |
 |---|---|
 | Rust | `rust-toolchain.toml` pins the channel (1.97.0 at the time of writing) with `rustfmt` and `clippy`; rustup installs it on first use. The CI workflows pin the same version, so bump them together |
-| `protoc` | Required: `build.rs` compiles the CoreML protobuf schemas, and `webnn-onnx-utils` the ONNX one (default `onnx` feature). Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
+| `protoc` | Required for `webnn-onnx-utils` with the `onnx` feature. CoreML uses checked-in generated schemas and does not require `protoc`. Linux `apt-get install protobuf-compiler`, macOS `brew install protobuf`, Windows `winget install Google.Protobuf` |
 | `flatc` | Required for `litert-runtime` (TFLite schema). CI downloads the flatbuffers release binary; macOS `brew install flatbuffers` |
 | Node.js | WPT corpus fetch and evaluation (`scripts/fetch_wpt.mjs`, `scripts/wpt_bridge/`) |
 | Python 3 | Only for MkDocs (`pip install -r docs/requirements.txt`) and `scripts/generate_backend_operator_report.py` |
@@ -35,7 +35,8 @@ The mock backend features and `dynamic-inputs`, `native-examples`, `pollster`, a
 
 The default `cli` feature builds the `rustnn` binary and pulls in `clap` and
 `tracing-subscriber`, and enables `onnx` for CLI conversion. Library consumers can drop
-these with `default-features = false`.
+these with `default-features = false`. Enable `burn-runtime-cpu` for the portable CPU
+backend and optionally `coreml-runtime` on Apple platforms; neither requires ONNX.
 
 ## Build and test
 

@@ -67,6 +67,7 @@ pub(crate) struct CoremlTensor {
 pub(crate) struct CoremlGraph {
     model: CompiledCoremlModel,
     output_backings_eligible: bool,
+    exact_integer_graph: Option<Box<GraphInfo>>,
 }
 
 impl CoremlGraph {
@@ -101,6 +102,8 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
         let converted = CoremlMlProgramConverter
             .convert(&graph_info)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let exact_integer_graph =
+            supports_exact_integer_execution(&graph_info).then(|| Box::new(graph_info.clone()));
         let model = compile_model(
             converted.data,
             converted.weights_data,
@@ -112,6 +115,7 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for CoremlBuilder 
             MLBackendGraph::CoremlModel(CoremlGraph {
                 model,
                 output_backings_eligible,
+                exact_integer_graph,
             }),
             &graph_info,
         )
@@ -141,29 +145,174 @@ fn supports_in_memory_asset(graph: &GraphInfo) -> bool {
         Operation::Gather { indices, .. } => graph
             .operand(*indices)
             .is_some_and(|operand| operand.descriptor.shape.is_empty()),
-        // The in-memory execution path loses int32 precision around 2^31 when
-        // evaluating the typed `mul(x, -1)` used to lower WebNN neg.
-        Operation::Neg { input, .. } => graph
+        // The in-memory compiler loses low int32 bits in these kernels even
+        // when their MIL operands and outputs are explicitly typed as int32.
+        Operation::Abs { input, .. }
+        | Operation::Neg { input, .. }
+        | Operation::Relu { input, .. }
+        | Operation::Clamp { input, .. }
+        | Operation::Triangular { input, .. } => graph
             .operand(*input)
             .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32),
-        // Integer triangular subtraction is exact through URL compilation;
-        // the memory path loses low bits of retained int32 values beyond 2^24.
-        Operation::Triangular { input, options, .. } => {
-            let upper = options
-                .as_ref()
-                .and_then(|options| options.upper)
-                .unwrap_or(true);
-            let diagonal = options
-                .as_ref()
-                .map(|options| options.diagonal)
-                .unwrap_or(0);
-            ((upper && diagonal > 0) || (!upper && diagonal < 0))
-                && graph
-                    .operand(*input)
-                    .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
-        }
         _ => false,
     })
+}
+
+fn requires_exact_int32(graph: &GraphInfo) -> bool {
+    graph.operations.iter().any(|operation| {
+        let input = match operation {
+            Operation::Abs { input, .. }
+            | Operation::Neg { input, .. }
+            | Operation::Relu { input, .. }
+            | Operation::Clamp { input, .. }
+            | Operation::Triangular { input, .. } => *input,
+            _ => return false,
+        };
+        graph
+            .operand(input)
+            .is_some_and(|operand| operand.descriptor.data_type == DataType::Int32)
+    })
+}
+
+// The inference sandbox blocks MobileGestalt hardware identification, so CoreML
+// uses a cached Espresso fallback that loses int32 bits instead of BNNS.
+// Evaluate these shape-preserving kernels directly when the whole graph permits it.
+fn supports_exact_integer_execution(graph: &GraphInfo) -> bool {
+    requires_exact_int32(graph)
+        && !graph.has_dynamic_dimensions()
+        && graph
+            .operands
+            .iter()
+            .all(|operand| operand.descriptor.data_type == DataType::Int32)
+        && graph.operations.iter().all(|operation| {
+            matches!(
+                operation,
+                Operation::Abs { .. }
+                    | Operation::Neg { .. }
+                    | Operation::Relu { .. }
+                    | Operation::Clamp { .. }
+                    | Operation::Triangular { .. }
+                    | Operation::Identity { .. }
+            )
+        })
+}
+
+fn execute_integer_graph(
+    graph: &GraphInfo,
+    inputs: &MLNamedTensors,
+    tensors: &[CoremlTensor],
+) -> crate::error::Result<HashMap<String, Vec<u8>>> {
+    let invalid = || Error::GraphDispatchError {
+        source: "invalid exact integer graph binding".into(),
+    };
+    let decode = |bytes: &[u8]| -> crate::error::Result<Vec<i32>> {
+        if !bytes.len().is_multiple_of(4) {
+            return Err(invalid());
+        }
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect())
+    };
+    let mut values: Vec<Option<Vec<i32>>> = vec![None; graph.operands.len()];
+    for (&id, constant) in &graph.constant_operand_ids_to_handles {
+        values[id as usize] = Some(decode(&constant.data)?);
+    }
+    for &id in &graph.input_operands {
+        let operand = graph.operand(id).ok_or_else(invalid)?;
+        let name = operand.name.as_deref().ok_or_else(invalid)?;
+        let tensor = inputs.get(name).ok_or_else(invalid)?;
+        let bytes = tensors[tensor.id]
+            .storage
+            .host()
+            .map_err(|e| Error::GraphDispatchError { source: e.into() })?;
+        values[id as usize] = Some(decode(bytes)?);
+    }
+    for operation in &graph.operations {
+        let input = *operation.input_operands().first().ok_or_else(invalid)?;
+        let mut result = values[input as usize].as_ref().ok_or_else(invalid)?.clone();
+        match operation {
+            Operation::Abs { .. } => result.iter_mut().for_each(|v| *v = v.saturating_abs()),
+            Operation::Neg { .. } => result.iter_mut().for_each(|v| *v = v.saturating_neg()),
+            Operation::Relu { .. } => result.iter_mut().for_each(|v| *v = (*v).max(0)),
+            Operation::Clamp { options, .. } => {
+                let bound = |value: Option<&serde_json::Value>, default: i32| {
+                    value.map_or(default, |v| {
+                        let number = v
+                            .as_f64()
+                            .or_else(|| match v.as_str() {
+                                Some("NaN") => Some(f64::NAN),
+                                Some("Infinity") => Some(f64::INFINITY),
+                                Some("-Infinity") => Some(f64::NEG_INFINITY),
+                                _ => None,
+                            })
+                            .unwrap_or(default as f64);
+                        number.round_ties_even() as i32
+                    })
+                };
+                let lower = bound(
+                    options.as_ref().and_then(|o| o.min_value.as_ref()),
+                    i32::MIN,
+                );
+                let upper = bound(
+                    options.as_ref().and_then(|o| o.max_value.as_ref()),
+                    i32::MAX,
+                );
+                if lower > upper {
+                    return Err(invalid());
+                }
+                result
+                    .iter_mut()
+                    .for_each(|v| *v = (*v).clamp(lower, upper));
+            }
+            Operation::Triangular { options, .. } => {
+                let shape = graph.operands[input as usize]
+                    .descriptor
+                    .static_or_max_shape();
+                let [.., rows, cols] = shape.as_slice() else {
+                    return Err(invalid());
+                };
+                let (rows, cols) = (*rows as usize, *cols as usize);
+                if rows == 0 || cols == 0 {
+                    return Err(invalid());
+                }
+                let upper = options.as_ref().and_then(|o| o.upper).unwrap_or(true);
+                let diagonal = options.as_ref().map_or(0, |o| o.diagonal) as i64;
+                for (index, value) in result.iter_mut().enumerate() {
+                    let distance = (index % cols) as i64 - ((index / cols) % rows) as i64;
+                    let keep = if upper {
+                        distance >= diagonal
+                    } else {
+                        distance <= diagonal
+                    };
+                    if !keep {
+                        *value = 0;
+                    }
+                }
+            }
+            Operation::Identity { .. } => {}
+            _ => return Err(invalid()),
+        }
+        let output = operation.output_operand().ok_or_else(invalid)?;
+        values[output as usize] = Some(result);
+    }
+    graph
+        .output_operands
+        .iter()
+        .map(|&id| {
+            let name = graph.operands[id as usize]
+                .name
+                .as_deref()
+                .ok_or_else(invalid)?;
+            let bytes = values[id as usize]
+                .as_ref()
+                .ok_or_else(invalid)?
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            Ok((name.to_owned(), bytes))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -359,7 +508,15 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
             })?
             .model
             .proven_copy_output_count();
-        let out_bytes = if self.options.reuse_tensor_storage {
+        let exact = graph
+            .backend
+            .as_coreml_model()
+            .and_then(|g| g.exact_integer_graph.as_ref());
+        let used_exact = exact.is_some();
+        let out_bytes = if let Some(exact) = exact {
+            self.statistics.last_compute_units = "CPU_ONLY";
+            execute_integer_graph(exact, inputs, &self.tensors)?
+        } else if self.options.reuse_tensor_storage {
             self.dispatch_native(graph, inputs, outputs)?
         } else {
             let coreml_graph =
@@ -448,7 +605,7 @@ impl<'context> MLBackendContext<'context> for CoremlContext {
         };
 
         for (&name, ml_tensor) in outputs.iter() {
-            if self.tensors[ml_tensor.id].storage.is_native() {
+            if !used_exact && self.tensors[ml_tensor.id].storage.is_native() {
                 continue;
             }
             let data = out_bytes
@@ -608,7 +765,7 @@ mod test {
     }
 
     #[test]
-    fn triangular_url_compilation_is_limited_to_excluded_main_int32() {
+    fn triangular_int32_uses_url_compilation() {
         use crate::graph::{
             DataType, GraphInfo, Operand, OperandDescriptor, OperandKind, to_dimension_vector,
         };
@@ -639,8 +796,7 @@ mod test {
                         }],
                         ..Default::default()
                     };
-                    let needs_url = dtype == DataType::Int32
-                        && ((upper && diagonal > 0) || (!upper && diagonal < 0));
+                    let needs_url = dtype == DataType::Int32;
                     assert_eq!(
                         super::supports_in_memory_asset(&graph),
                         !needs_url,
@@ -1085,6 +1241,36 @@ mod test {
         let mut result = vec![0u8; 5];
         context.read_tensor(&out, &mut result).unwrap();
         assert_eq!(result, [0, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn coreml_abs_preserves_int32_boundary_values() {
+        let mut context = coreml_context().expect("CoreML is available");
+        let desc = MLOperandDescriptor::new(MLOperandDataType::Int32, vec![1, 2, 2, 1]);
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let input = builder.input("absInput", &desc).unwrap();
+        let output = builder.abs(input).unwrap();
+        let mut named = MLNamedOperands::new();
+        named.insert("absOutput", output);
+        let mut graph = builder.build(&named).unwrap();
+        assert_eq!(load_route(&graph), CoremlLoadRoute::CompiledUrl);
+
+        let mut io = MLTensorDescriptor::from_operand_descriptor(&desc);
+        io.set_writable(true);
+        io.set_readable(true);
+        let input = context.create_tensor(&io).unwrap();
+        let output = context.create_tensor(&io).unwrap();
+        context
+            .write_tensor(&input, &[-2147483647i32, 0, 2147483646, 2147483647])
+            .unwrap();
+        let mut inputs = MLNamedTensors::new();
+        inputs.insert("absInput", &input);
+        let mut outputs = MLNamedTensors::new();
+        outputs.insert("absOutput", &output);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+        let mut result = vec![0i32; 4];
+        context.read_tensor(&output, &mut result).unwrap();
+        assert_eq!(result, [2147483647, 0, 2147483646, 2147483647]);
     }
 
     #[test]
