@@ -137,13 +137,14 @@ Rules that hold for every converter:
   This adaptation currently applies to static shapes.
 - Float16 weights go to the weight blob written by `weight_file_builder.rs` and returned as
   `weights_data`.
-- Static float32 `add`, `sub`, `mul`, `div`, `pow`, `sin`, `cos` and `concat` expressions are evaluated before
-  CoreML lowering when each result is at most 4 MiB. This avoids a BNNS compiler
-  memory fault for broadcast sinusoidal positional embeddings followed by concat
-  and transpose (observed on macOS 26.6.2). Floating inputs retain float32 arithmetic;
-  dynamic values and float16 expressions use their native lowering. The existing
-  constant-view pass then resolves reshapes and transposes of those results.
-- `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
+- Static float16/float32 `add`, `sub`, `mul`, `div`, `pow`, `sin`, `cos`, `concat` and
+  constant outer products (`matmul` with inner dimension one) are evaluated before CoreML
+  lowering, with at most 1,048,576 elements per result (4 MiB for float32). Half results
+  round to float16 at each folded operation. General dot products and dynamic values retain
+  native lowering. This removes positional-embedding patterns that trigger BNNS concat
+  compilation faults and ANE `ReplaceMatmulWithConv` failures. Views of the results fold
+  in the same pass, including identity aliases shared by rotary-embedding constants.
+- `identity`, `transpose`, `reshape` and `cast` of a constant are folded into a new constant before
   emission (`coreml_constant_fold.rs`, applied to a copy of the graph at the start of
   `convert_with_float16_precision`, for both float16 lowerings). The Neural Engine admits `matmul(x, const)` but refuses
   `matmul(x, transpose(const))`, and a literal lowering would also transpose the weight on

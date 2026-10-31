@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-//! Folds constant views and bounded float32 positional expressions before CoreML lowering.
+//! Folds constant views and bounded float16/float32 positional expressions before CoreML lowering.
 //!
 //! BNNS can fault while compiling a broadcast divide followed by sine/cosine, concat
 //! and transpose. Resolve these static expressions before handing the graph to CoreML.
@@ -23,9 +23,9 @@
 //! The Apple Neural Engine admits `matmul(x, const)` but refuses `matmul(x, transpose(const))`
 //! (measured with Core ML's compute plan on A12 and A13). GPT-Neo style graphs carry one such
 //! transpose per projection, so lowering it literally also costs one run-time transpose of the
-//! weight per token on the CPU and GPU paths. This prepass rewrites the three view operations
+//! weight per token on the CPU and GPU paths. This prepass rewrites these view operations
 //! over constants into new constants at convert time, on a clone of the [`GraphInfo`], and
-//! also resolves bounded float32 positional expressions. In both cases:
+//! also resolves bounded float16/float32 positional expressions. In both cases:
 //!
 //! - the input must be an [`OperandKind::Constant`] with payload bytes, a static shape, no
 //!   pending layout permutation and a whole-byte element type (4-bit constants are skipped);
@@ -54,12 +54,14 @@ pub(crate) fn fold_constant_views(graph: &GraphInfo) -> Option<GraphInfo> {
         matches!(
             operation,
             Operation::Transpose { .. }
+                | Operation::Identity { .. }
                 | Operation::Reshape { .. }
                 | Operation::Cast { .. }
                 | Operation::Div { .. }
                 | Operation::Add { .. }
                 | Operation::Sub { .. }
                 | Operation::Mul { .. }
+                | Operation::Matmul { .. }
                 | Operation::Pow { .. }
                 | Operation::Sin { .. }
                 | Operation::Cos { .. }
@@ -128,6 +130,7 @@ pub(crate) fn fold_constant_views(graph: &GraphInfo) -> Option<GraphInfo> {
 fn fold_one(graph: &GraphInfo, operation: &Operation) -> Option<(u32, u32, Vec<u8>)> {
     let input = match operation {
         Operation::Transpose { input, .. }
+        | Operation::Identity { input, .. }
         | Operation::Reshape { input, .. }
         | Operation::Cast { input, .. } => *input,
         _ => return None,
@@ -171,6 +174,12 @@ fn fold_one(graph: &GraphInfo, operation: &Operation) -> Option<(u32, u32, Vec<u
     }
 
     let payload = match operation {
+        Operation::Identity { .. } => {
+            if source_type != destination_type || source_shape != destination_shape {
+                return None;
+            }
+            data.clone()
+        }
         Operation::Transpose { options, .. } => {
             if source_type != destination_type {
                 return None;
@@ -240,6 +249,7 @@ fn fold_float_expression(
             | Operation::Add { .. }
             | Operation::Sub { .. }
             | Operation::Mul { .. }
+            | Operation::Matmul { .. }
             | Operation::Pow { .. }
             | Operation::Sin { .. }
             | Operation::Cos { .. }
@@ -253,11 +263,16 @@ fn fold_float_expression(
     }
     let destination = graph.operand(output)?;
     if destination.kind != OperandKind::Intermediate
-        || destination.descriptor.data_type != DataType::Float32
+        || !matches!(
+            destination.descriptor.data_type,
+            DataType::Float32 | DataType::Float16
+        )
         || !destination.descriptor.pending_permutation.is_empty()
     {
         return None;
     }
+    let dtype = destination.descriptor.data_type;
+    let width = dtype.bytes_per_element();
     let shape = destination.descriptor.static_shape()?;
     let count = destination.descriptor.element_count()?;
     if count > 1_048_576 {
@@ -269,21 +284,35 @@ fn fold_float_expression(
     for &input in &inputs {
         let source = graph.operand(input)?;
         if source.kind != OperandKind::Constant
-            || source.descriptor.data_type != DataType::Float32
+            || source.descriptor.data_type != dtype
             || !source.descriptor.pending_permutation.is_empty()
         {
             return None;
         }
         let data = &graph.constant_operand_ids_to_handles.get(&input)?.data;
-        if data.len() != source.descriptor.element_count()?.checked_mul(4)? {
+        if data.len() != source.descriptor.element_count()?.checked_mul(width)? {
             return None;
         }
         shapes.push(source.descriptor.static_shape()?);
         values.push(
-            data.chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().expect("four-byte chunk")))
+            data.chunks_exact(width)
+                .map(|v| match dtype {
+                    DataType::Float16 => {
+                        half::f16::from_le_bytes(v.try_into().expect("two-byte chunk")).to_f32()
+                    }
+                    _ => f32::from_le_bytes(v.try_into().expect("four-byte chunk")),
+                })
                 .collect::<Vec<_>>(),
         );
+    }
+    // A K=1 matmul is an outer product: its output is the ordinary broadcast
+    // product of [..., M, 1] and [..., 1, N]. Other dot products stay native.
+    if matches!(operation, Operation::Matmul { .. })
+        && (shapes.iter().any(|s| s.len() < 2)
+            || shapes[0].last() != Some(&1)
+            || shapes[1][shapes[1].len() - 2] != 1)
+    {
+        return None;
     }
     let result: Vec<f32> = match operation {
         Operation::Sin { .. } | Operation::Cos { .. } => {
@@ -305,6 +334,7 @@ fn fold_float_expression(
         | Operation::Add { .. }
         | Operation::Sub { .. }
         | Operation::Mul { .. }
+        | Operation::Matmul { .. }
         | Operation::Pow { .. } => {
             // Row-major broadcast offsets, including scalar inputs.
             let strides = shapes
@@ -343,6 +373,9 @@ fn fold_float_expression(
                         Operation::Add { .. } => values[0][offsets[0]] + values[1][offsets[1]],
                         Operation::Sub { .. } => values[0][offsets[0]] - values[1][offsets[1]],
                         Operation::Mul { .. } => values[0][offsets[0]] * values[1][offsets[1]],
+                        Operation::Matmul { .. } => {
+                            0.0 + values[0][offsets[0]] * values[1][offsets[1]]
+                        }
                         Operation::Pow { .. } => values[0][offsets[0]].powf(values[1][offsets[1]]),
                         _ => values[0][offsets[0]] / values[1][offsets[1]],
                     }
@@ -383,7 +416,14 @@ fn fold_float_expression(
     Some((
         inputs,
         output,
-        result.into_iter().flat_map(f32::to_le_bytes).collect(),
+        if dtype == DataType::Float16 {
+            result
+                .into_iter()
+                .flat_map(|v| half::f16::from_f32(v).to_le_bytes())
+                .collect()
+        } else {
+            result.into_iter().flat_map(f32::to_le_bytes).collect()
+        },
     ))
 }
 
@@ -1290,5 +1330,95 @@ mod tests {
             expected.len() + 128,
             "the untransposed original is not emitted"
         );
+    }
+}
+
+#[cfg(test)]
+mod outer_product_tests {
+    use super::*;
+    use crate::mlcontext::{MLNamedOperands, MLOperandDescriptor};
+    use crate::mlgraphbuilder::MLGraphBuilder;
+    use crate::operator_enums::MLOperandDataType;
+
+    fn graph(dtype: MLOperandDataType, rows: usize, k: usize, columns: usize) -> GraphInfo {
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let descriptor = |shape| MLOperandDescriptor::new(dtype, shape);
+        let bytes = |n| {
+            (0..n)
+                .flat_map(|i| {
+                    let value = (i as f32 + 1.) / 8.;
+                    if dtype == MLOperandDataType::Float16 {
+                        half::f16::from_f32(value).to_le_bytes().to_vec()
+                    } else {
+                        value.to_le_bytes().to_vec()
+                    }
+                })
+                .collect()
+        };
+        let a = builder
+            .constant_from_bytes(&descriptor(vec![1, rows as u64, k as u64]), bytes(rows * k))
+            .unwrap();
+        let b = builder
+            .constant_from_bytes(
+                &descriptor(vec![1, k as u64, columns as u64]),
+                bytes(k * columns),
+            )
+            .unwrap();
+        let alias = builder.identity(b).unwrap();
+        let product = builder.matmul(a, alias).unwrap();
+        let cosine = builder.cos(product).unwrap();
+        let input = builder.input("input", &descriptor(vec![1])).unwrap();
+        let result = builder.add(input, cosine).unwrap();
+        builder
+            .finish_graph_info(&MLNamedOperands::from([("result", result)]))
+            .unwrap()
+    }
+    #[test]
+    fn constant_outer_product_and_trig_fold_with_half_rounding() {
+        for dtype in [MLOperandDataType::Float16, MLOperandDataType::Float32] {
+            let original = graph(dtype, 3, 1, 4);
+            let folded = fold_constant_views(&original).unwrap();
+            assert_eq!(folded.operations.len(), 1);
+            let Operation::Add { b, .. } = folded.operations[0] else {
+                panic!("expected runtime add")
+            };
+            let data = &folded.constant_operand_ids_to_handles[&b].data;
+            for row in 0..3 {
+                for col in 0..4 {
+                    let angle = (row as f32 + 1.) / 8. * ((col as f32 + 1.) / 8.);
+                    let offset = row * 4 + col;
+                    if dtype == MLOperandDataType::Float16 {
+                        let expected =
+                            half::f16::from_f32(half::f16::from_f32(angle).to_f32().cos());
+                        assert_eq!(&data[offset * 2..offset * 2 + 2], &expected.to_le_bytes());
+                    } else {
+                        assert_eq!(
+                            &data[offset * 4..offset * 4 + 4],
+                            &angle.cos().to_le_bytes()
+                        );
+                    }
+                }
+            }
+            assert!(
+                original
+                    .operations
+                    .iter()
+                    .any(|op| matches!(op, Operation::Matmul { .. }))
+            );
+        }
+    }
+    #[test]
+    fn general_dot_products_and_large_outer_products_stay_native() {
+        for dtype in [MLOperandDataType::Float16, MLOperandDataType::Float32] {
+            for graph in [graph(dtype, 3, 2, 4), graph(dtype, 1025, 1, 1025)] {
+                let folded = fold_constant_views(&graph).unwrap();
+                assert!(
+                    folded
+                        .operations
+                        .iter()
+                        .any(|op| matches!(op, Operation::Matmul { .. }))
+                );
+            }
+        }
     }
 }
