@@ -220,3 +220,39 @@ from persistent input storage and reduced host copying. A `smollm_model` configu
 import/build/nonempty-cache dispatch readiness only. Its output explicitly records that no
 numerical reference was validated, so it must not be reported as a SmolLM quality or throughput
 benchmark.
+
+### Explicit CoreML precision experiment
+
+`examples/coreml_precision_probe.rs` loads an external `.webnn` graph and named float32
+`safetensors` inputs, executes it through `MLContext`, and writes float32 output tensors,
+per-dispatch timing, nonfinite counts and CoreML load diagnostics. It also retains a copy
+of a URL-compiled model for inspection with Apple's compute-plan tools. This is a local
+conversion experiment, not automatic lowering of WebNN float32 operations to float16.
+
+```sh
+cargo run --release --features coreml-runtime --example coreml_precision_probe --   model.webnn --inputs inputs.safetensors --output results/fp32 --device cpu
+cargo run --release --features coreml-runtime --example coreml_precision_probe --   model.webnn --inputs inputs.safetensors --output results/fp16 --device npu --fp16
+```
+
+`--fp16` explicitly changes float32 graph operands, constant storage and cast targets to
+float16, including the inputs/outputs. Reference inputs are rounded to the requested graph
+type before dispatch. The report counts constant overflow and underflow; finite constant
+overflow is rejected unless `--allow-constant-overflow` is explicitly selected. A CPU-only
+load fallback is rejected rather than reported as an accelerator result. CPU+Neural Engine
+still permits CPU operations internally; inspect the compute plan before claiming NPU use.
+
+Compare output tensors and reconstructed audio against the unmodified graph over several
+representative inputs, including silence and quiet audio. A finite output alone does not
+establish acceptable quality; normalization thresholds can underflow in float16 even when
+all constant values fit its maximum range. Device-sensitive results are measurements of
+the supplied graph, device and OS, not a general FP16 or Neural Engine conformance claim.
+
+For a mixed-precision experiment, `--fp32-ops reduceL2,clamp,div` preserves the selected
+operation types in float32; `--fp32-prefixes prefix1,prefix2` selects operations by their
+labels. These modes preserve graph input types, carry precision through data movement,
+insert explicit casts at arithmetic boundaries and return float32 floating outputs.
+Original float32 constant arithmetic and integer-to-float32 casts remain float32: this
+preserves rotary-position accuracy and avoids overflowing shape-derived sample counts.
+Compiled-artifact capture expects a single new model directory; run probes sequentially.
+They do not infer a safe accuracy policy for a model. Source graphs and their default
+execution are unchanged; label selections are specific to the supplied export.
